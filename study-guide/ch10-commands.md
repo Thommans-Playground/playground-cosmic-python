@@ -44,16 +44,318 @@ flowchart LR
 - `handle(message, uow)` dispatches on `isinstance(message, events.Event | commands.Command)` into `handle_event` / `handle_command`.
 - `EVENT_HANDLERS` (dict of lists) vs `COMMAND_HANDLERS` (dict of single handlers).
 - Commands from the API: Flask catches exceptions from the bus (`InvalidSku` → 400).
-- Handlers are small and take `(cmd, uow)`; the `allocate` handler no longer returns the event; it emits `Allocated`, and the API returns the batch ref via a read path (ch12 motivation).
+- Handlers are small and take `(cmd, uow)`; the `allocate` handler still returns the batch reference (the bus collects *command* results so Flask can use them), and `Product.allocate` also emits an `Allocated` event for downstream listeners (ch11, ch12).
 - Aggregate emits `Allocated` after success, which makes room for downstream consumers (ch11).
 
-## 🛞 Touchdown
-1. Create `commands.py`; rename the "requests" from ch09 into commands.
-2. Split the handler registries; update `messagebus.handle`.
-3. Add exception handling: command → re-raise; event → log and continue.
-4. Add `Allocated` event emitted from `Product.allocate`.
-5. Test: a failing event handler doesn't stop other handlers (use a handler that raises).
-6. Flask: translate command-handler exceptions into HTTP responses.
+## 🛞 Touchdown: code along
+
+> Starts from your finished ch09 project. In ch09 we called everything an "event", but `AllocationRequired` is not a fact, it's a *request*. This chapter separates **commands** from **events** and gives each its own error handling. 38 tests pass, 1 skipped (Postgres).
+
+### Step 1: The vocabulary
+
+| | Command | Event |
+|---|---|---|
+| Meaning | "Please do X" | "X happened" |
+| Name | Imperative: `Allocate` | Past tense: `Allocated` |
+| Handlers | **Exactly one** | **Zero or more** |
+| If handling fails | The **sender must find out** (exception propagates) | **Log it and carry on**; other listeners and the already-committed work are unaffected |
+
+**Do:** create `domain/commands.py`, and slim `events.py` down to two real events.
+
+**📄 `src/allocation/domain/commands.py`**
+
+```python
+from datetime import date
+from typing import Optional
+from dataclasses import dataclass
+
+
+class Command:
+    pass
+
+
+@dataclass
+class Allocate(Command):
+    orderid: str
+    sku: str
+    qty: int
+
+
+@dataclass
+class CreateBatch(Command):
+    ref: str
+    sku: str
+    qty: int
+    eta: Optional[date] = None
+
+
+@dataclass
+class ChangeBatchQuantity(Command):
+    ref: str
+    qty: int
+```
+
+**📄 `src/allocation/domain/events.py`**
+
+```python
+from dataclasses import dataclass
+
+
+class Event:
+    pass
+
+
+@dataclass
+class Allocated(Event):
+    orderid: str
+    sku: str
+    qty: int
+    batchref: str
+
+
+@dataclass
+class OutOfStock(Event):
+    sku: str
+```
+
+Renames: `BatchCreated → CreateBatch`, `AllocationRequired → Allocate`, `BatchQuantityChanged → ChangeBatchQuantity`. Use find-and-replace across `src/` and `tests/`, then fix imports.
+
+### Step 2: The model emits a real event, and a command
+
+**Do:** in `Product.allocate`, after a successful allocation append `events.Allocated(...)`. In `change_batch_quantity`, the freed lines now produce `commands.Allocate(...)` (the domain is asking the system to re-do work). Add `from allocation.domain import commands, events` to `model.py`.
+
+```python
+# in Product.allocate, after batch.allocate(line):
+self.events.append(
+    events.Allocated(
+        orderid=line.orderid, sku=line.sku, qty=line.qty, batchref=batch.reference
+    )
+)
+
+# in Product.change_batch_quantity:
+while batch.available_quantity < 0:
+    line = batch.deallocate_one()
+    self.events.append(commands.Allocate(line.orderid, line.sku, line.qty))
+```
+
+Add a test first in `tests/unit/test_product.py`:
+
+```python
+def test_records_allocated_event():
+    product = Product(
+        sku="SCANDI-PEN", batches=[Batch("b1", "SCANDI-PEN", 100, eta=None)]
+    )
+    product.allocate(OrderLine("oref", "SCANDI-PEN", 10))
+    assert product.events[-1] == events.Allocated(
+        orderid="oref", sku="SCANDI-PEN", qty=10, batchref="b1"
+    )
+```
+
+### Step 3: Handlers take commands; the one event handler stays
+
+**Do:** change the handler parameter types to the new command classes (the function bodies are unchanged). Keep `send_out_of_stock_notification` as an event handler.
+
+**📄 `src/allocation/service_layer/handlers.py`**
+
+```python
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+from allocation.adapters import email
+from allocation.domain import commands, events, model
+from allocation.domain.model import OrderLine
+
+if TYPE_CHECKING:
+    from . import unit_of_work
+
+
+class InvalidSku(Exception):
+    pass
+
+
+def add_batch(cmd: commands.CreateBatch, uow: unit_of_work.AbstractUnitOfWork):
+    with uow:
+        product = uow.products.get(sku=cmd.sku)
+        if product is None:
+            product = model.Product(cmd.sku, batches=[])
+            uow.products.add(product)
+        product.batches.append(model.Batch(cmd.ref, cmd.sku, cmd.qty, cmd.eta))
+        uow.commit()
+
+
+def allocate(cmd: commands.Allocate, uow: unit_of_work.AbstractUnitOfWork):
+    line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
+    with uow:
+        product = uow.products.get(sku=line.sku)
+        if product is None:
+            raise InvalidSku(f"Invalid sku {line.sku}")
+        batchref = product.allocate(line)
+        uow.commit()
+        return batchref
+
+
+def change_batch_quantity(
+    cmd: commands.ChangeBatchQuantity, uow: unit_of_work.AbstractUnitOfWork
+):
+    with uow:
+        product = uow.products.get_by_batchref(batchref=cmd.ref)
+        product.change_batch_quantity(ref=cmd.ref, qty=cmd.qty)
+        uow.commit()
+
+
+# --- event handlers: reactions to facts, no return value -----------------
+def send_out_of_stock_notification(
+    event: events.OutOfStock, uow: unit_of_work.AbstractUnitOfWork
+):
+    email.send(
+        "stock@made.com",
+        f"Out of stock for {event.sku}",
+    )
+```
+
+### Step 4: Two registries and two error policies
+
+**Do:** rewrite `messagebus.py`.
+
+**Why it looks like this:**
+- `COMMAND_HANDLERS` maps a command type to **one** function; `EVENT_HANDLERS` maps an event type to a **list**.
+- `handle_event` wraps each handler in `try/except`, **logs and continues**. By the time events are handled, the main transaction has committed; a broken email server shouldn't undo it or block other listeners.
+- `handle_command` logs and **re-raises**, so Flask can return an error.
+- Only command results are collected, so `results.pop(0)` in Flask still yields the batch reference.
+- `events.Allocated: []` is an empty list on purpose: a missing key would raise `KeyError` in `handle_event`. Ch11 gives it its first listener.
+
+**📄 `src/allocation/service_layer/messagebus.py`**
+
+```python
+from __future__ import annotations
+import logging
+from typing import List, Dict, Callable, Type, Union, TYPE_CHECKING
+
+from allocation.domain import commands, events
+from . import handlers
+
+if TYPE_CHECKING:
+    from . import unit_of_work
+
+logger = logging.getLogger(__name__)
+
+Message = Union[commands.Command, events.Event]
+
+
+def handle(message: Message, uow: unit_of_work.AbstractUnitOfWork):
+    results = []
+    queue = [message]
+    while queue:
+        message = queue.pop(0)
+        if isinstance(message, events.Event):
+            handle_event(message, queue, uow)
+        elif isinstance(message, commands.Command):
+            cmd_result = handle_command(message, queue, uow)
+            results.append(cmd_result)
+        else:
+            raise Exception(f"{message} was not an Event or Command")
+    return results
+
+
+def handle_event(
+    event: events.Event,
+    queue: List[Message],
+    uow: unit_of_work.AbstractUnitOfWork,
+):
+    for handler in EVENT_HANDLERS[type(event)]:
+        try:
+            logger.debug("handling event %s with handler %s", event, handler)
+            handler(event, uow=uow)
+            queue.extend(uow.collect_new_events())
+        except Exception:
+            # Events are announcements: one failing listener must not
+            # break the others, or the command that already succeeded.
+            logger.exception("Exception handling event %s", event)
+            continue
+
+
+def handle_command(
+    command: commands.Command,
+    queue: List[Message],
+    uow: unit_of_work.AbstractUnitOfWork,
+):
+    logger.debug("handling command %s", command)
+    try:
+        handler = COMMAND_HANDLERS[type(command)]
+        result = handler(command, uow=uow)
+        queue.extend(uow.collect_new_events())
+        return result
+    except Exception:
+        # Commands are requests: the caller needs to know if it failed.
+        logger.exception("Exception handling command %s", command)
+        raise
+
+
+EVENT_HANDLERS = {
+    events.OutOfStock: [handlers.send_out_of_stock_notification],
+    events.Allocated: [],  # nobody listens yet; ch11 adds a Redis publisher
+}  # type: Dict[Type[events.Event], List[Callable]]
+
+COMMAND_HANDLERS = {
+    commands.Allocate: handlers.allocate,
+    commands.CreateBatch: handlers.add_batch,
+    commands.ChangeBatchQuantity: handlers.change_batch_quantity,
+}  # type: Dict[Type[commands.Command], Callable]
+```
+
+### Step 5: Flask sends commands
+
+```python
+from allocation.domain import commands          # replaces the `events` import
+
+# add_batch endpoint
+cmd = commands.CreateBatch(request.json["ref"], request.json["sku"], request.json["qty"], eta)
+messagebus.handle(cmd, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
+
+# allocate endpoint
+cmd = commands.Allocate(request.json["orderid"], request.json["sku"], request.json["qty"])
+results = messagebus.handle(cmd, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
+batchref = results.pop(0)
+```
+
+### Step 6: Test the error policy itself
+
+**Do:** in `tests/unit/test_handlers.py`, rename the events to commands (`events.BatchCreated` → `commands.CreateBatch`, etc.) and add these two tests. They are the entire point of the chapter.
+
+```python
+class TestEventErrors:
+    def test_a_failing_event_handler_does_not_stop_the_others(self):
+        calls = []
+
+        def bad(event, uow):
+            raise RuntimeError("boom")
+
+        def good(event, uow):
+            calls.append(event)
+
+        with mock.patch.dict(messagebus.EVENT_HANDLERS, {events.OutOfStock: [bad, good]}):
+            messagebus.handle(events.OutOfStock("SOME-SKU"), FakeUnitOfWork())
+
+        assert calls == [events.OutOfStock("SOME-SKU")]
+
+    def test_command_errors_propagate_to_the_caller(self):
+        with pytest.raises(handlers.InvalidSku):
+            messagebus.handle(commands.Allocate("o1", "NOPE", 1), FakeUnitOfWork())
+```
+
+```bash
+pytest -q
+# 38 passed, 1 skipped
+```
+
+### A question to answer in your notes
+
+If an event handler fails and we only log it, how would we ever know to retry? (The book's answer: that's a real design problem; options include retries with a library like `tenacity`, a dead-letter store, or making handlers idempotent and replayable. Pick one and write a paragraph.)
+
+### Stretch
+
+- Add a `Deallocated` event and a `commands.Deallocate`. Which existing files stay untouched?
+- Make `handle_event` retry a failing handler up to 3 times (`tenacity` makes this a decorator). Write a test with a handler that fails twice, then succeeds.
 
 ## Check yourself
 - Give a rule of thumb for choosing between command and event.

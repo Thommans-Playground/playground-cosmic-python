@@ -37,6 +37,28 @@ Then a **Check yourself** list: if you can't answer these out loud, re-read befo
 | 13 | Dependency Injection | Bootstrapping, composition root | [ch13](ch13-dependency-injection.md) |
 | – | Epilogue + Appendices | What to do Monday morning | [epilogue](14-epilogue.md) |
 
+## What's in each chapter's "Touchdown: code along"
+
+Numbered steps, each with **Do** (what to type), **Why** (the reasoning), the code, and the command to run. The code in the guides was **extracted from working projects whose tests I ran**, one per chapter, not written from memory.
+
+| Ch | Tests I ran | Not run (need external services) |
+|---|---|---|
+| 1 | 11 passed | |
+| 2 | 19 passed | |
+| 3 | 5 passed | |
+| 4 | 24 passed | |
+| 5 | 28 passed | |
+| 6 | 30 passed | |
+| 7 | 32 passed | 1 test needing **Postgres** (concurrency) |
+| 8 | 34 passed | same Postgres test |
+| 9 | 35 passed | same Postgres test |
+| 10 | 38 passed | same Postgres test |
+| 11 | 41 passed | Postgres test + the **Redis end-to-end** test (needs the full stack) |
+| 12 | 43 passed | same two |
+| 13 | 43 passed | same two (the finished app was also run for real with curl on SQLite) |
+
+The tests marked "not run" are written, and skip themselves unless you provide the service (`POSTGRES_URI`, `API_URL`). Ch07 and ch11 tell you how to run them with Docker. If one of those fails on your machine, the chapter's test is the first suspect, not you.
+
 ## The route as a map
 
 ```mermaid
