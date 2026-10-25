@@ -243,6 +243,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from allocation.channels import Channel
 from allocation.domain import commands, events, model
 from allocation.domain.model import OrderLine
 
@@ -332,7 +333,7 @@ def publish_allocated_event(event: events.Allocated, publish: Callable):
         event: The allocation that just happened.
         publish: Sends an event to a channel (Redis in production, a stub in tests).
     """
-    publish("line_allocated", event)
+    publish(Channel.LINE_ALLOCATED, event)
 
 
 def reallocate(event: events.Deallocated, uow: unit_of_work.AbstractUnitOfWork):
@@ -748,6 +749,7 @@ import redis
 from pydantic import BaseModel, Field, ValidationError
 
 from allocation import bootstrap, config
+from allocation.channels import Channel
 from allocation.domain import commands
 from allocation.service_layer import messagebus
 
@@ -772,7 +774,7 @@ def main():
     settings = config.get_settings()
     r = redis.Redis(host=settings.redis_host, port=settings.redis_port)
     pubsub = r.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe("change_batch_quantity")
+    pubsub.subscribe(Channel.CHANGE_BATCH_QUANTITY)
 
     for m in pubsub.listen():
         handle_change_batch_quantity(m, bus)
@@ -917,6 +919,7 @@ import pytest
 
 from allocation import bootstrap
 from allocation.adapters import notifications, repository
+from allocation.channels import Channel
 from allocation.domain import commands, events
 from allocation.service_layer import handlers, unit_of_work
 
@@ -1041,7 +1044,7 @@ class TestAllocate:
 
         bus.handle(commands.Allocate("o1", "LAMP", 10))
 
-        assert published == [("line_allocated", events.Allocated("o1", "LAMP", 10, "b1"))]
+        assert published == [(Channel.LINE_ALLOCATED, events.Allocated("o1", "LAMP", 10, "b1"))]
 
 
 class TestChangeBatchQuantity:
@@ -1111,6 +1114,7 @@ from unittest import mock
 import pytest
 
 from allocation.adapters import redis_eventpublisher
+from allocation.channels import Channel
 from allocation.domain import commands, events
 from allocation.entrypoints import redis_eventconsumer
 
@@ -1118,9 +1122,11 @@ from allocation.entrypoints import redis_eventconsumer
 def test_publish_serialises_the_event_as_json():
     # The one place we still fake a library: this is a test OF the Redis adapter.
     with mock.patch.object(redis_eventpublisher, "r") as fake_client:
-        redis_eventpublisher.publish("line_allocated", events.Allocated("o1", "SOME-SKU", 5, "b1"))
+        redis_eventpublisher.publish(
+            Channel.LINE_ALLOCATED, events.Allocated("o1", "SOME-SKU", 5, "b1")
+        )
     channel, payload = fake_client.publish.call_args.args
-    assert channel == "line_allocated"
+    assert channel == Channel.LINE_ALLOCATED
     assert json.loads(payload) == {
         "orderid": "o1",
         "sku": "SOME-SKU",

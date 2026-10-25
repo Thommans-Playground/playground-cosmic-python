@@ -91,6 +91,24 @@ def allocate(cmd, uow):
 **Why it's right:** each side can change internally without touching the other.
 **What it costs:** a translation layer to write and test, and you now own backward compatibility for anything you publish.
 
+### Addition 4: naming the channels
+
+**The conventional way:** bare strings, repeated wherever they're used.
+
+```python
+r.publish("line_allocated", payload)          # the publisher
+pubsub.subscribe("line_allocted")             # the subscriber: spot the typo
+```
+
+**Where it breaks**
+- 📖 Publishing to a Redis channel nobody is subscribed to is **not an error**: `PUBLISH` just reports zero receivers. So a misspelled channel fails *silently*. The code runs, tests that fake Redis pass, and nothing ever arrives.
+- The same names are repeated in the publisher, the consumer, the e2e test and other teams' code, so a rename means hunting for strings.
+
+**The better way** (Step 2b): a `Channel(StrEnum)` in one module.
+
+**Why it's right:** 🧪 I checked the two properties that matter. A member is still a real `str` (redis-py encodes `Channel.LINE_ALLOCATED` to `b'line_allocated'`, and it equals the plain string), and a misspelled member (`Channel.LINE_ALOCATED`) raises `AttributeError` immediately, which the type checker also flags while you type.
+**What it costs:** it only protects *your* side of the contract. Other services keep their own strings, so the names must still be agreed with them. And adding a channel is a code change, which is fine here because channels are few and deliberate (it would not be fine for SKUs).
+
 ## 🛬 1,000 ft: design decisions
 - `redis_eventconsumer.py`: subscribes to a channel (`change_batch_quantity`), deserialises JSON → `commands.ChangeBatchQuantity` → `messagebus.handle`.
 - `redis_eventpublisher.py`: handler `publish_allocated_event` for `Allocated` → `r.publish("line_allocated", json.dumps(asdict(event)))`.
@@ -172,6 +190,7 @@ from dataclasses import asdict
 import redis
 
 from allocation import config
+from allocation.channels import Channel
 from allocation.domain import events
 
 logger = logging.getLogger(__name__)
@@ -182,14 +201,14 @@ _settings = config.get_settings()
 r = redis.Redis(host=_settings.redis_host, port=_settings.redis_port)
 
 
-def publish(channel, event: events.Event):
+def publish(channel: Channel, event: events.Event):
     """Publish ``event`` as JSON on a Redis channel.
 
     The JSON shape is a contract with other services: renaming an event field is a breaking
     change for every subscriber.
 
     Args:
-        channel: Name of the Redis channel.
+        channel: Which channel to publish on.
         event: The event to publish. Must be a dataclass instance.
     """
     logger.info("publishing: channel=%s, event=%s", channel, event)
@@ -198,6 +217,35 @@ def publish(channel, event: events.Event):
 
 > `dataclasses.asdict()` only accepts dataclass instances, so the `Event` base class in `events.py` becomes a `@dataclass` too (it has no fields). The type checker (`ty`, mypy) flags it otherwise.
 
+### Step 2b: Name the channels with a `StrEnum`
+
+**Do:** create `allocation/channels.py` and use `Channel.LINE_ALLOCATED` / `Channel.CHANGE_BATCH_QUANTITY` wherever the guide used the bare strings (the publisher's signature, the handler, the consumer, the tests).
+
+**Why a `StrEnum` here (and not for SKUs):** the channel list is **small, fixed and part of the contract** with other services, which is exactly what an enum is for. A `StrEnum` member *is* a `str`, so Redis accepts it and it compares equal to the plain string; but a typo such as `Channel.LINE_ALOCATED` fails the moment the code runs, and the type checker catches it as you type. (SKUs are open-ended data that grows at runtime, so they stay `str`.)
+
+**📄 `src/allocation/channels.py`**
+
+```python
+"""Names of the Redis channels shared with other services.
+
+These strings are part of the contract with those services: renaming one is a breaking
+change for every publisher or subscriber on the other end.
+"""
+
+from enum import StrEnum
+
+
+class Channel(StrEnum):
+    """A Redis pub/sub channel.
+
+    A ``StrEnum`` is a real ``str``, so a member can be passed straight to Redis or compared with
+    a plain string, but a typo such as ``Channel.LINE_ALOCATED`` fails immediately.
+    """
+
+    LINE_ALLOCATED = "line_allocated"
+    CHANGE_BATCH_QUANTITY = "change_batch_quantity"
+```
+
 ### Step 3: Subscribe it as an event handler
 
 **Do:** add a handler in `handlers.py` and register it for `Allocated` in `messagebus.py` (this is where the empty list from ch10 gets its first listener).
@@ -205,6 +253,7 @@ def publish(channel, event: events.Event):
 ```python
 # handlers.py
 from allocation.adapters import email, redis_eventpublisher    # extended import
+from allocation.channels import Channel
 
 def publish_allocated_event(event: events.Allocated, uow: unit_of_work.AbstractUnitOfWork):
     """Tell other services, via Redis, that a line was allocated.
@@ -213,7 +262,7 @@ def publish_allocated_event(event: events.Allocated, uow: unit_of_work.AbstractU
         event: The allocation that just happened.
         uow: Unused here; the bus passes it to every handler.
     """
-    redis_eventpublisher.publish("line_allocated", event)
+    redis_eventpublisher.publish(Channel.LINE_ALLOCATED, event)
 ```
 
 ```python
@@ -254,15 +303,18 @@ from unittest import mock
 import pytest
 
 from allocation.adapters import redis_eventpublisher
+from allocation.channels import Channel
 from allocation.domain import commands, events
 from allocation.entrypoints import redis_eventconsumer
 
 
 def test_publish_serialises_the_event_as_json(fake_redis):
-    redis_eventpublisher.publish("line_allocated", events.Allocated("o1", "SOME-SKU", 5, "b1"))
+    redis_eventpublisher.publish(
+        Channel.LINE_ALLOCATED, events.Allocated("o1", "SOME-SKU", 5, "b1")
+    )
 
     channel, payload = fake_redis.publish.call_args.args
-    assert channel == "line_allocated"
+    assert channel == Channel.LINE_ALLOCATED
     assert json.loads(payload) == {
         "orderid": "o1",
         "sku": "SOME-SKU",
@@ -310,7 +362,7 @@ class TestPublishing:
         messagebus.handle(commands.Allocate("o1", "LAMP", 10), uow)
 
         channel, payload = fake_redis.publish.call_args.args
-        assert channel == "line_allocated"
+        assert channel == Channel.LINE_ALLOCATED
         assert json.loads(payload)["batchref"] == "b1"
 ```
 
@@ -338,6 +390,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from allocation import config
 from allocation.adapters import orm
+from allocation.channels import Channel
 from allocation.domain import commands
 from allocation.service_layer import messagebus, unit_of_work
 
@@ -363,7 +416,7 @@ def main():
     session_factory = orm.make_session_factory(settings.db_uri)
     r = redis.Redis(host=settings.redis_host, port=settings.redis_port)
     pubsub = r.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe("change_batch_quantity")
+    pubsub.subscribe(Channel.CHANGE_BATCH_QUANTITY)
 
     for m in pubsub.listen():
         handle_change_batch_quantity(m, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
@@ -437,6 +490,7 @@ import pytest
 import redis
 
 from allocation import config
+from allocation.channels import Channel
 
 _s = config.get_settings()
 
@@ -479,10 +533,10 @@ def test_change_batch_quantity_leading_to_reallocation():
     r = post_to_allocate(orderid, sku, 10)
     assert r.json()["batchref"] == earlier_batch
 
-    subscription = subscribe_to("line_allocated")
+    subscription = subscribe_to(Channel.LINE_ALLOCATED)
 
     # the shipment of the earlier batch is damaged: only 5 units survive
-    publish_message("change_batch_quantity", {"batchref": earlier_batch, "qty": 5})
+    publish_message(Channel.CHANGE_BATCH_QUANTITY, {"batchref": earlier_batch, "qty": 5})
 
     # the order is bumped and re-allocated to the later batch
     messages = []
