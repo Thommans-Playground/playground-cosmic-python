@@ -122,16 +122,25 @@ MessageBus(uow, event_handlers, command_handlers)   ← a class, not a module of
 **📄 `src/allocation/config.py`**
 
 ```python
+"""Typed application settings, read from the environment."""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed settings, read from environment variables (DB_URI=...) or a .env file.
+    """Application settings.
 
-    Invalid values (REDIS_PORT=banana) fail at startup with a clear error,
-    not later when something first tries to connect.
+    Each field can be set with an environment variable of the same name (``DB_URI``,
+    ``REDIS_PORT``, ...) or in a ``.env`` file. Invalid values fail at startup.
+
+    Attributes:
+        db_uri: SQLAlchemy database URL. Defaults to a local SQLite file.
+        redis_host: Host of the Redis server used for messaging between services.
+        redis_port: Port of the Redis server.
+        email_host: SMTP host for outgoing notifications.
+        email_port: SMTP port.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -145,6 +154,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return the settings, reading the environment once and caching the result."""
     return Settings()
 ```
 
@@ -153,6 +163,8 @@ def get_settings() -> Settings:
 **📄 `src/allocation/adapters/notifications.py`**
 
 ```python
+"""Notification adapters: how the application tells humans something happened."""
+
 import abc
 import smtplib
 
@@ -160,18 +172,41 @@ from allocation import config
 
 
 class AbstractNotifications(abc.ABC):
+    """Something that can send a notification to a destination."""
+
     @abc.abstractmethod
     def send(self, destination, message):
+        """Send ``message`` to ``destination``.
+
+        Args:
+            destination: Where to send it, for example an email address.
+            message: The text to send.
+        """
         raise NotImplementedError
 
 
 class EmailNotifications(AbstractNotifications):
+    """Send notifications by email over SMTP.
+
+    It connects when it sends, not when it is created, so building one never needs a mail server.
+
+    Args:
+        smtp_host: SMTP host. Defaults to the ``email_host`` setting.
+        port: SMTP port. Defaults to the ``email_port`` setting.
+    """
+
     def __init__(self, smtp_host=None, port=None):
         settings = config.get_settings()
         self.smtp_host = smtp_host or settings.email_host
         self.port = port or settings.email_port
 
     def send(self, destination, message):
+        """Email ``message`` to ``destination``.
+
+        Args:
+            destination: The recipient's email address.
+            message: The body of the email.
+        """
         msg = f"Subject: allocation service notification\n{message}"
         # connect at send time, so constructing this never needs a mail server
         with smtplib.SMTP(self.smtp_host, port=self.port) as server:
@@ -193,6 +228,13 @@ Also move the two registries (`EVENT_HANDLERS`, `COMMAND_HANDLERS`) to the botto
 **📄 `src/allocation/service_layer/handlers.py`**
 
 ```python
+"""Message handlers: one function per use case or reaction.
+
+Each handler declares what it needs (``uow``, ``notifications``, ``publish``) as a parameter
+name, and ``bootstrap.py`` supplies the matching dependency. Handlers never import their
+collaborators.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -211,12 +253,20 @@ if TYPE_CHECKING:
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
 # Each handler declares what it needs as parameters. The bootstrap script
 # looks at those names and passes in matching dependencies.
 def add_batch(cmd: commands.CreateBatch, uow: unit_of_work.AbstractUnitOfWork):
+    """Record a new batch, creating its product the first time its SKU appears.
+
+    Args:
+        cmd: Describes the new batch.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get(sku=cmd.sku)
         if product is None:
@@ -227,6 +277,18 @@ def add_batch(cmd: commands.CreateBatch, uow: unit_of_work.AbstractUnitOfWork):
 
 
 def allocate(cmd: commands.Allocate, uow: unit_of_work.AbstractUnitOfWork):
+    """Allocate an order line.
+
+    Args:
+        cmd: Describes the order line.
+        uow: The unit of work that wraps the transaction.
+
+    Returns:
+        The reference of the chosen batch, or ``None`` if the SKU is out of stock.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+    """
     line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
     with uow:
         product = uow.products.get(sku=line.sku)
@@ -238,6 +300,12 @@ def allocate(cmd: commands.Allocate, uow: unit_of_work.AbstractUnitOfWork):
 
 
 def change_batch_quantity(cmd: commands.ChangeBatchQuantity, uow: unit_of_work.AbstractUnitOfWork):
+    """Change a batch's quantity; the product bumps and re-queues any lines that no longer fit.
+
+    Args:
+        cmd: Names the batch and its new quantity.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get_by_batchref(batchref=cmd.ref)
         product.change_batch_quantity(ref=cmd.ref, qty=cmd.qty)
@@ -248,18 +316,42 @@ def change_batch_quantity(cmd: commands.ChangeBatchQuantity, uow: unit_of_work.A
 def send_out_of_stock_notification(
     event: events.OutOfStock, notifications: notifications.AbstractNotifications
 ):
+    """Notify the purchasing team that a SKU ran out.
+
+    Args:
+        event: The out-of-stock event.
+        notifications: How to deliver the message (email in production, a fake in tests).
+    """
     notifications.send("stock@made.com", f"Out of stock for {event.sku}")
 
 
 def publish_allocated_event(event: events.Allocated, publish: Callable):
+    """Tell other services that a line was allocated.
+
+    Args:
+        event: The allocation that just happened.
+        publish: Sends an event to a channel (Redis in production, a stub in tests).
+    """
     publish("line_allocated", event)
 
 
 def reallocate(event: events.Deallocated, uow: unit_of_work.AbstractUnitOfWork):
+    """Allocate again a line that lost its batch.
+
+    Args:
+        event: The line that was deallocated.
+        uow: The unit of work that wraps the transaction.
+    """
     allocate(commands.Allocate(**asdict(event)), uow=uow)
 
 
 def add_allocation_to_read_model(event: events.Allocated, uow: unit_of_work.AbstractUnitOfWork):
+    """Record an allocation in the read model that serves ``GET /allocations``.
+
+    Args:
+        event: The allocation that just happened.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         uow.session.execute(
             text(
@@ -274,6 +366,12 @@ def add_allocation_to_read_model(event: events.Allocated, uow: unit_of_work.Abst
 def remove_allocation_from_read_model(
     event: events.Deallocated, uow: unit_of_work.AbstractUnitOfWork
 ):
+    """Remove a deallocated line from the read model.
+
+    Args:
+        event: The line that lost its allocation.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         uow.session.execute(
             text("DELETE FROM allocations_view WHERE orderid = :orderid AND sku = :sku"),
@@ -302,6 +400,13 @@ COMMAND_HANDLERS: dict[type[commands.Command], Callable] = {
 **📄 `src/allocation/service_layer/messagebus.py`**
 
 ```python
+"""The message bus: routes commands and events to their handlers.
+
+A command has exactly one handler and its errors reach the caller. An event has any number of
+handlers and their errors are logged, so one failing listener cannot break the others.
+Handlers arrive already wired to their dependencies (see ``bootstrap.py``).
+"""
+
 from __future__ import annotations
 
 import logging
@@ -319,6 +424,17 @@ Message = commands.Command | events.Event
 
 
 class MessageBus:
+    """Routes messages to handlers that are already wired to their dependencies.
+
+    Create one per request or per message stream: it holds a queue of pending messages and a
+    unit of work, which must not be shared between threads.
+
+    Args:
+        uow: The unit of work whose events are collected after each handler.
+        event_handlers: For each event type, the list of handlers to run.
+        command_handlers: For each command type, its single handler.
+    """
+
     def __init__(
         self,
         uow: unit_of_work.AbstractUnitOfWork,
@@ -330,6 +446,14 @@ class MessageBus:
         self.command_handlers = command_handlers
 
     def handle(self, message: Message):
+        """Handle a message, then every message its handlers cause, in order.
+
+        Args:
+            message: The first command or event to handle.
+
+        Returns:
+            The results of the commands that ran, in order.
+        """
         results = []
         self.queue = [message]
         while self.queue:
@@ -344,6 +468,11 @@ class MessageBus:
         return results
 
     def handle_event(self, event: events.Event):
+        """Run every handler for ``event``, logging errors instead of raising them.
+
+        Args:
+            event: The event to handle.
+        """
         for handler in self.event_handlers[type(event)]:
             try:
                 logger.debug("handling event %s with handler %s", event, handler)
@@ -354,6 +483,17 @@ class MessageBus:
                 continue
 
     def handle_command(self, command: commands.Command):
+        """Run the single handler for ``command``.
+
+        Args:
+            command: The command to handle.
+
+        Returns:
+            Whatever the handler returned.
+
+        Raises:
+            Exception: Any error from the handler is logged and re-raised to the sender.
+        """
         logger.debug("handling command %s", command)
         try:
             handler = self.command_handlers[type(command)]
@@ -378,7 +518,10 @@ class MessageBus:
 **📄 `src/allocation/bootstrap.py`**
 
 ```python
-"""The composition root: the ONE place that knows about concrete classes."""
+"""The composition root: the one place that knows which concrete classes to use.
+
+Everything else depends on abstractions and has its collaborators handed to it.
+"""
 
 import inspect
 from collections.abc import Callable
@@ -390,6 +533,7 @@ from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
 def default_uow() -> unit_of_work.SqlAlchemyUnitOfWork:
+    """Build the real unit of work from the settings."""
     session_factory = orm.make_session_factory(config.get_settings().db_uri)
     return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
@@ -401,6 +545,21 @@ def bootstrap(
     publish: Callable = redis_eventpublisher.publish,
 ) -> messagebus.MessageBus:
     # Everything has a real default; tests override only what they need.
+    """Wire up a message bus and everything it needs.
+
+    Every argument has a real default, so production calls this with no arguments and a test
+    overrides only what it wants to fake.
+
+    Args:
+        start_orm: Whether to map the domain classes onto tables. Tests that already did pass
+            ``False``.
+        uow: The unit of work. Defaults to the SQLAlchemy one from the settings.
+        notifications: How to notify humans. Defaults to email.
+        publish: Publishes an event to other services. Defaults to Redis.
+
+    Returns:
+        A message bus whose handlers already have their dependencies.
+    """
     if uow is None:
         uow = default_uow()
     if notifications is None:
@@ -427,10 +586,10 @@ def bootstrap(
 
 
 def make_bus_factory() -> Callable[[], messagebus.MessageBus]:
-    """For servers that handle requests concurrently: one bus (and UoW) per request.
+    """Return a function that builds a fresh bus, for servers that handle requests concurrently.
 
-    Start the ORM mappers and build the session factory once; building a bus is
-    just wiring a few closures, so doing it per request is cheap.
+    The ORM mappers and the session factory are set up once. Building a bus is only wiring a few
+    closures, so doing it for every request is cheap, and each request gets its own unit of work.
     """
     orm.start_mappers()
     session_factory = orm.make_session_factory(config.get_settings().db_uri)
@@ -443,7 +602,14 @@ def make_bus_factory() -> Callable[[], messagebus.MessageBus]:
 
 
 def inject_dependencies(handler, dependencies):
-    """Return handler(message) with whichever of `dependencies` it asks for, by name."""
+    """Return ``handler`` as a function of the message alone, with its dependencies filled in.
+
+    A dependency is passed only if the handler has a parameter of the same name.
+
+    Args:
+        handler: A command or event handler.
+        dependencies: Available dependencies, keyed by parameter name.
+    """
     params = inspect.signature(handler).parameters
     deps = {name: dep for name, dep in dependencies.items() if name in params}
     return lambda message: handler(message, **deps)
@@ -458,6 +624,12 @@ def inject_dependencies(handler, dependencies):
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: sends commands to the bus and serves reads from the read model.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from collections.abc import Callable
 from datetime import date
 from typing import Annotated
@@ -471,6 +643,15 @@ from allocation.service_layer import handlers, messagebus
 
 
 class AddBatchRequest(BaseModel):
+    """Body of ``POST /add_batch``.
+
+    Attributes:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased. Must be greater than zero.
+        eta: Arrival date, or ``null`` for warehouse stock.
+    """
+
     ref: str
     sku: str
     qty: int = Field(gt=0)
@@ -478,38 +659,65 @@ class AddBatchRequest(BaseModel):
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
-class AllocateResponse(BaseModel):
-    batchref: str
-
-
 class AllocationOut(BaseModel):
+    """One allocation, as returned by ``GET /allocations/{orderid}``.
+
+    Attributes:
+        sku: The product.
+        batchref: Reference of the batch the line is allocated to.
+    """
+
     sku: str
     batchref: str
 
 
 def create_app(bus_factory: Callable[[], messagebus.MessageBus] | None = None) -> FastAPI:
     # Tests pass in a factory wired with fakes; production builds the real one.
+    """Build the FastAPI application.
+
+    Args:
+        bus_factory: Creates a message bus for each request. Tests pass one wired with fakes;
+            when omitted, the real one is built from the settings.
+
+    Returns:
+        The configured application.
+    """
     bus_factory = bus_factory or bootstrap.make_bus_factory()
     app = FastAPI(title="Allocation service")
 
     def get_bus() -> messagebus.MessageBus:
         # A fresh bus (and so a fresh UoW and queue) per request. FastAPI runs
         # these sync endpoints in a thread pool, so sharing one would be a race.
+        """Build a fresh bus, and so a fresh unit of work, for one request."""
         return bus_factory()
 
     Bus = Annotated[messagebus.MessageBus, Depends(get_bus)]
 
     @app.post("/add_batch", status_code=201)
     def add_batch_endpoint(body: AddBatchRequest, bus: Bus) -> None:
+        """Add a batch of stock, creating its product if the SKU is new."""
         bus.handle(commands.CreateBatch(body.ref, body.sku, body.qty, body.eta))
 
     @app.post("/allocate", status_code=202)
     def allocate_endpoint(body: AllocateRequest, bus: Bus) -> None:
+        """Accept a request to allocate an order line.
+
+        Returns 202 straight away; read the result from ``GET /allocations/{orderid}``. Returns 400
+        if the SKU is unknown.
+        """
         try:
             bus.handle(commands.Allocate(body.orderid, body.sku, body.qty))
         except handlers.InvalidSku as e:
@@ -517,6 +725,7 @@ def create_app(bus_factory: Callable[[], messagebus.MessageBus] | None = None) -
 
     @app.get("/allocations/{orderid}")
     def allocations_endpoint(orderid: str, bus: Bus) -> list[AllocationOut]:
+        """Return where each line of an order was allocated, or 404 if there are none."""
         result = views.allocations(orderid, bus.uow)
         if not result:
             raise HTTPException(status_code=404, detail="not found")
@@ -528,6 +737,11 @@ def create_app(bus_factory: Callable[[], messagebus.MessageBus] | None = None) -
 **📄 `src/allocation/entrypoints/redis_eventconsumer.py`**
 
 ```python
+"""Listen for messages from other services on Redis and turn them into commands.
+
+The other service's wire format stays at this edge; nothing inside knows about it.
+"""
+
 import logging
 
 import redis
@@ -541,13 +755,19 @@ logger = logging.getLogger(__name__)
 
 
 class ChangeBatchQuantityMessage(BaseModel):
-    """The other service's wire format, validated at the edge before it becomes a command."""
+    """The ``change_batch_quantity`` message, as sent by the other service.
+
+    Attributes:
+        batchref: Reference of the batch that changed.
+        qty: Its new purchased quantity.
+    """
 
     batchref: str
     qty: int = Field(ge=0)
 
 
 def main():
+    """Subscribe to ``change_batch_quantity`` and handle messages until stopped."""
     bus = bootstrap.bootstrap()
     settings = config.get_settings()
     r = redis.Redis(host=settings.redis_host, port=settings.redis_port)
@@ -559,6 +779,14 @@ def main():
 
 
 def handle_change_batch_quantity(m, bus: messagebus.MessageBus):
+    """Validate one Redis message and handle it as a ``ChangeBatchQuantity`` command.
+
+    Malformed messages are logged and dropped rather than crashing the consumer.
+
+    Args:
+        m: The raw Redis pub/sub message; its ``data`` holds the JSON payload.
+        bus: The message bus to send the command to.
+    """
     logger.info("handling %s", m)
     try:
         msg = ChangeBatchQuantityMessage.model_validate_json(m["data"])

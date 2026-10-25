@@ -142,7 +142,15 @@ target-version = "py312"
 src = [".", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "D"]
+# D104: empty __init__.py files; D105/D107: magic methods and __init__ (documented on the class)
+ignore = ["D104", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
 ```
 
 ### The rules (what "sync" means)
@@ -202,6 +210,12 @@ def test_when_a_file_no_longer_exists_in_the_source():
 **📄 `sync/sync.py`**
 
 ```python
+"""Make a destination folder match a source folder, comparing files by content hash.
+
+A pure decision function (the functional core) is wrapped by a thin layer that does the I/O
+(the imperative shell).
+"""
+
 import hashlib
 import os
 import shutil
@@ -211,6 +225,11 @@ BLOCKSIZE = 65536
 
 
 def hash_file(path):
+    """Return the SHA-1 hex digest of a file's contents, read in blocks.
+
+    Args:
+        path: The file to hash.
+    """
     hasher = hashlib.sha1()
     with path.open("rb") as file:
         buf = file.read(BLOCKSIZE)
@@ -222,6 +241,19 @@ def hash_file(path):
 
 # --- functional core: plain data in, plain data out, no I/O -----------------
 def determine_actions(src_hashes, dst_hashes, src_folder, dst_folder):
+    """Decide what must happen to make the destination match the source.
+
+    Pure: it does no I/O, so it can be tested with plain dicts.
+
+    Args:
+        src_hashes: ``{hash: filename}`` for the source folder.
+        dst_hashes: ``{hash: filename}`` for the destination folder.
+        src_folder: Path of the source folder.
+        dst_folder: Path of the destination folder.
+
+    Yields:
+        ``("copy", src, dst)``, ``("move", old, new)`` or ``("delete", path)`` tuples.
+    """
     for sha, filename in src_hashes.items():
         if sha not in dst_hashes:
             sourcepath = Path(src_folder) / filename
@@ -240,6 +272,11 @@ def determine_actions(src_hashes, dst_hashes, src_folder, dst_folder):
 
 # --- imperative shell: the only code that touches the disk ------------------
 def read_paths_and_hashes(root):
+    """Return ``{hash: filename}`` for every file under ``root``.
+
+    Args:
+        root: The folder to scan.
+    """
     hashes = {}
     for folder, _, files in os.walk(root):
         for fn in files:
@@ -248,17 +285,46 @@ def read_paths_and_hashes(root):
 
 
 class FileSystem:
+    """The real file operations, behind the same interface a test fake provides."""
+
     def copy(self, source, dest):
+        """Copy a file.
+
+        Args:
+            source: The file to copy.
+            dest: Where to put the copy.
+        """
         shutil.copyfile(source, dest)
 
     def move(self, source, dest):
+        """Move or rename a file.
+
+        Args:
+            source: The current path.
+            dest: The new path.
+        """
         shutil.move(source, dest)
 
     def delete(self, dest):
+        """Delete a file.
+
+        Args:
+            dest: The file to delete.
+        """
         os.remove(dest)
 
 
 def sync(source, dest, reader=read_paths_and_hashes, filesystem=None):
+    """Make ``dest`` match ``source``.
+
+    The reader and filesystem can be replaced, which is how tests run without touching a disk.
+
+    Args:
+        source: The folder to copy from.
+        dest: The folder to change.
+        reader: Returns ``{hash: filename}`` for a folder.
+        filesystem: Performs the copy, move and delete actions. Defaults to the real one.
+    """
     if filesystem is None:  # not `or`: an empty fake list is falsy!
         filesystem = FileSystem()
 

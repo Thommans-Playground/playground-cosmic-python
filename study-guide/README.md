@@ -60,7 +60,7 @@ Numbered steps, each with **Do** (what to type), **Why** (the reasoning), the co
 | 12 | 50 passed | same two |
 | 13 | 51 passed | same two |
 
-Every chapter also passes `ruff check` and `ruff format --check`, and chapters 1-13 pass `ty check src` (ch13 also passes mypy). The finished ch13 project was synced from scratch with `uv sync` and tested on Python 3.12, then run for real with uvicorn and curl (201, 202, 400, 404 and pydantic's 422 all behaved as the guide says).
+Every chapter also passes `ruff check` (including the docstring rules, Google convention) and `ruff format --check`, and chapters 1-13 pass `ty check src` (ch13 also passes mypy). The finished ch13 project was synced from scratch with `uv sync` and tested on Python 3.12, then run for real with uvicorn and curl (201, 202, 400, 404 and pydantic's 422 all behaved as the guide says).
 
 The tests marked "not run" are written, and skip themselves unless you provide the service (`POSTGRES_URI`, `API_URL`). Ch07 and ch11 tell you how to run them with Docker. If one of those fails on your machine, the chapter's test is the first suspect, not you.
 

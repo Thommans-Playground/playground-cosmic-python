@@ -118,36 +118,51 @@ touch src/allocation/service_layer/__init__.py src/allocation/entrypoints/__init
 **📄 `src/allocation/adapters/repository.py`**
 
 ```python
+"""Repositories: the application's view of storage as a collection of aggregates."""
+
 import abc
 
 from allocation.domain import model
 
 
 class AbstractRepository(abc.ABC):
+    """The smallest storage interface the application needs, for batches.
+
+    Implemented by the real SQLAlchemy repository and by an in-memory fake in tests.
+    """
+
     @abc.abstractmethod
     def add(self, batch: model.Batch):
+        """Add a batch to the collection."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def get(self, reference) -> model.Batch:
+        """Return the batch with this reference."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def list(self):
+        """Return every batch."""
         raise NotImplementedError
 
 
 class SqlAlchemyRepository(AbstractRepository):
+    """Repository backed by a SQLAlchemy session."""
+
     def __init__(self, session):
         self.session = session
 
     def add(self, batch):
+        """Add a batch to the session."""
         self.session.add(batch)
 
     def get(self, reference):
+        """Return the batch with this reference."""
         return self.session.query(model.Batch).filter_by(reference=reference).one()
 
     def list(self):
+        """Return every batch."""
         return self.session.query(model.Batch).all()
 ```
 
@@ -225,19 +240,44 @@ def test_commits():
 **📄 `src/allocation/service_layer/services.py`**
 
 ```python
+"""Application services: one function per use case.
+
+Services orchestrate (fetch, call the domain, commit); the business rules stay in the model.
+They take plain values, never web objects, so any entrypoint can call them.
+"""
+
 from allocation.adapters import repository
 from allocation.domain import model
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
 def is_valid_sku(sku, batches):
+    """Return whether any of ``batches`` is for ``sku``."""
     return sku in {b.sku for b in batches}
 
 
 def allocate(orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session) -> str:
+    """Allocate an order line to a batch.
+
+    Args:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units.
+        repo: Where batches are stored.
+        session: The database session to commit.
+
+    Returns:
+        The reference of the batch that was allocated.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+        OutOfStock: If no batch can take the line.
+    """
     line = model.OrderLine(orderid, sku, qty)
     batches = repo.list()
     if not is_valid_sku(line.sku, batches):
@@ -256,16 +296,21 @@ def allocate(orderid: str, sku: str, qty: int, repo: repository.AbstractReposito
 **📄 `src/allocation/config.py`**
 
 ```python
+"""Typed application settings, read from the environment."""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed settings, read from environment variables (DB_URI=...) or a .env file.
+    """Application settings.
 
-    Invalid values (REDIS_PORT=banana) fail at startup with a clear error,
-    not later when something first tries to connect.
+    Each field can be set with an environment variable of the same name (``DB_URI``,
+    ``REDIS_PORT``, ...) or in a ``.env`` file. Invalid values fail at startup.
+
+    Attributes:
+        db_uri: SQLAlchemy database URL. Defaults to a local SQLite file.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -275,6 +320,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return the settings, reading the environment once and caching the result."""
     return Settings()
 ```
 
@@ -295,6 +341,12 @@ SQLite by default means the app runs with zero setup. To use Postgres later: `uv
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: translates requests into calls to the service layer and back.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from collections.abc import Iterator
 from typing import Annotated
 
@@ -310,16 +362,39 @@ from allocation.service_layer import services
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
 class AllocateResponse(BaseModel):
+    """Body returned by ``POST /allocate``.
+
+    Attributes:
+        batchref: Reference of the batch the line was allocated to.
+    """
+
     batchref: str
 
 
 def create_app(session_factory=None) -> FastAPI:
+    """Build the FastAPI application.
+
+    Args:
+        session_factory: Creates database sessions. Tests pass a throwaway database; when
+            omitted, the real one from the settings is used.
+
+    Returns:
+        The configured application.
+    """
     if session_factory is None:
         engine = create_engine(config.get_settings().db_uri)
         orm.metadata.create_all(engine)
@@ -331,6 +406,7 @@ def create_app(session_factory=None) -> FastAPI:
     def get_session() -> Iterator[Session]:
         # A "yield" dependency: FastAPI runs the code after the yield once the
         # response is done, so the session is always closed.
+        """Yield a session for one request and always close it afterwards."""
         session = session_factory()
         try:
             yield session
@@ -341,6 +417,10 @@ def create_app(session_factory=None) -> FastAPI:
 
     @app.post("/allocate", status_code=201)
     def allocate_endpoint(body: AllocateRequest, session: DbSession) -> AllocateResponse:
+        """Allocate an order line to a batch.
+
+        Returns 201 with the batch reference, or 400 if the SKU is unknown or out of stock.
+        """
         repo = repository.SqlAlchemyRepository(session)
         try:
             batchref = services.allocate(body.orderid, body.sku, body.qty, repo, session)

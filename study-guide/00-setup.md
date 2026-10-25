@@ -73,6 +73,32 @@ uv run ty check src       # type check
 uv sync                   # rebuild the environment from uv.lock on a new machine
 ```
 
+## Docstrings and comments
+
+The code in the guides uses **Google-style docstrings** (PEP 257 compatible) on every public module, class and function:
+
+```python
+def allocate(self, line: OrderLine) -> str | None:
+    """Allocate ``line`` to the best available batch of this SKU.
+
+    Args:
+        line: The order line to allocate.
+
+    Returns:
+        The reference of the chosen batch, or ``None`` if no batch can take the line.
+    """
+```
+
+A one-line summary that ends with a full stop, then `Args:`, `Returns:`, `Raises:` (and `Attributes:` for classes and dataclasses) where they add something.
+
+- **A docstring says *what* and the contract**: what you may pass in, what comes back, what can go wrong. It is for the caller, who shouldn't have to read the body.
+- **A comment says *why***: the reason behind a line that would otherwise look arbitrary, for example `# sorted() uses Batch.__gt__, so the first batch that fits is the preferred one.` Don't write comments that repeat the code.
+- **Constructor arguments go on the class docstring**, so `__init__` and the magic methods (`__eq__`, `__hash__`) don't each need their own, unless they carry business meaning, as `Batch.__gt__` does.
+- **It is enforced**, not just encouraged: `pyproject.toml` turns on ruff's docstring rules (`D`, `convention = "google"`). `uv run ruff check` lists anything missing. Tests are exempt; their names are the documentation.
+- **FastAPI puts endpoint docstrings and pydantic model docstrings into the generated API docs** at `/docs`, so here they are documentation people actually read.
+
+You don't have to type every docstring as you follow along. Writing them as you go (at least the one-line summary) is good practice, and `ruff check` will tell you what you skipped.
+
 ## Things you'll run into (this differs from the book)
 
 The book's code was written for Flask, SQLAlchemy 1.x and an older Python. This guide's code has been run on **Python 3.12 and 3.14**. The differences, each explained where it comes up:

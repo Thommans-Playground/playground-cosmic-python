@@ -125,16 +125,25 @@ After:   FastAPI → messagebus.handle(AllocationRequired(...), uow)
 **📄 `src/allocation/domain/events.py`**
 
 ```python
+"""Domain events: facts about something that has already happened, named in the past tense.
+
+The model records them; handlers react to them. Nothing here knows who is listening.
+"""
+
 from dataclasses import dataclass
 from datetime import date
 
 
 class Event:
+    """Base class for domain events."""
+
     pass
 
 
 @dataclass
 class BatchCreated(Event):
+    """A batch of stock now exists (ch10 turns this request into a command)."""
+
     ref: str
     sku: str
     qty: int
@@ -143,12 +152,16 @@ class BatchCreated(Event):
 
 @dataclass
 class BatchQuantityChanged(Event):
+    """A batch's purchased quantity changed (this becomes a command in ch10)."""
+
     ref: str
     qty: int
 
 
 @dataclass
 class AllocationRequired(Event):
+    """An order line needs allocating (this becomes a command in ch10)."""
+
     orderid: str
     sku: str
     qty: int
@@ -156,6 +169,8 @@ class AllocationRequired(Event):
 
 @dataclass
 class OutOfStock(Event):
+    """A SKU could not be allocated because no batch has enough stock."""
+
     sku: str
 ```
 
@@ -168,17 +183,28 @@ class OutOfStock(Event):
 ```python
 # in class Batch
 def deallocate_one(self) -> OrderLine:
+    """Remove and return an arbitrary allocated line.
+
+    Used when a batch shrinks and some of its orders have to be moved elsewhere.
+    """
     return self._allocations.pop()
 
 # in class Product
 def change_batch_quantity(self, ref: str, qty: int):
+    """Change a batch's purchased quantity, bumping orders if it is now over-allocated.
+
+    Lines are deallocated one at a time until the batch fits. For each one an
+    ``events.AllocationRequired`` event is recorded so the bus can re-allocate it elsewhere.
+
+    Args:
+        ref: Reference of the batch to change.
+        qty: The new purchased quantity.
+    """
     batch = next(b for b in self.batches if b.reference == ref)
     batch._purchased_quantity = qty
     while batch.available_quantity < 0:
         line = batch.deallocate_one()
-        self.events.append(
-            events.AllocationRequired(line.orderid, line.sku, line.qty)
-        )
+        self.events.append(events.AllocationRequired(line.orderid, line.sku, line.qty))
 ```
 
 ### Step 3: The repository needs a second way to find a product
@@ -207,6 +233,12 @@ def _get_by_batchref(self, batchref):
 **📄 `src/allocation/service_layer/handlers.py`**
 
 ```python
+"""Message handlers: one function per use case or reaction.
+
+Command handlers do the work a sender asked for. Event handlers react to facts. Each takes
+the message plus a unit of work and returns a result only if the caller needs one.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -220,10 +252,18 @@ if TYPE_CHECKING:
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
 def add_batch(event: events.BatchCreated, uow: unit_of_work.AbstractUnitOfWork):
+    """Record a new batch, creating its product the first time its SKU appears.
+
+    Args:
+        event: Describes the new batch.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get(sku=event.sku)
         if product is None:
@@ -234,6 +274,18 @@ def add_batch(event: events.BatchCreated, uow: unit_of_work.AbstractUnitOfWork):
 
 
 def allocate(event: events.AllocationRequired, uow: unit_of_work.AbstractUnitOfWork):
+    """Allocate an order line.
+
+    Args:
+        event: Describes the order line.
+        uow: The unit of work that wraps the transaction.
+
+    Returns:
+        The reference of the chosen batch, or ``None`` if the SKU is out of stock.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+    """
     line = OrderLine(event.orderid, event.sku, event.qty)
     with uow:
         product = uow.products.get(sku=line.sku)
@@ -245,6 +297,12 @@ def allocate(event: events.AllocationRequired, uow: unit_of_work.AbstractUnitOfW
 
 
 def change_batch_quantity(event: events.BatchQuantityChanged, uow: unit_of_work.AbstractUnitOfWork):
+    """Change a batch's quantity; the product bumps and re-queues any lines that no longer fit.
+
+    Args:
+        event: Names the batch and its new quantity.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get_by_batchref(batchref=event.ref)
         product.change_batch_quantity(ref=event.ref, qty=event.qty)
@@ -252,6 +310,12 @@ def change_batch_quantity(event: events.BatchQuantityChanged, uow: unit_of_work.
 
 
 def send_out_of_stock_notification(event: events.OutOfStock, uow: unit_of_work.AbstractUnitOfWork):
+    """Email the purchasing team that a SKU ran out.
+
+    Args:
+        event: The out-of-stock event.
+        uow: Unused here; the bus passes it to every handler.
+    """
     email.send(
         "stock@made.com",
         f"Out of stock for {event.sku}",
@@ -267,6 +331,8 @@ def send_out_of_stock_notification(event: events.OutOfStock, uow: unit_of_work.A
 **📄 `src/allocation/service_layer/messagebus.py`**
 
 ```python
+"""The message bus: routes each message to its handlers."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -281,6 +347,15 @@ if TYPE_CHECKING:
 
 
 def handle(event: events.Event, uow: unit_of_work.AbstractUnitOfWork):
+    """Handle a message, then every message its handlers cause, in order.
+
+    Args:
+        event: The first message to handle.
+        uow: The unit of work given to every handler.
+
+    Returns:
+        The return values of all the handlers that ran, in order.
+    """
     results = []
     queue = [event]
     while queue:
@@ -307,7 +382,11 @@ HANDLERS: dict[type[events.Event], list[Callable]] = {
 **📄 `src/allocation/service_layer/unit_of_work.py`**
 
 ```python
-# pylint: disable=attribute-defined-outside-init
+"""The Unit of Work: one atomic operation, usable as a context manager.
+
+Leaving the ``with`` block without calling ``commit()`` rolls everything back.
+"""
+
 from __future__ import annotations
 
 import abc
@@ -316,55 +395,85 @@ from allocation.adapters import repository
 
 
 class AbstractUnitOfWork(abc.ABC):
+    """One atomic operation over a set of repositories.
+
+    Anything not explicitly committed is rolled back when the ``with`` block ends. The message
+    bus asks it for the events recorded by the products it touched.
+    """
+
     products: repository.AbstractRepository
 
     def __enter__(self) -> AbstractUnitOfWork:
+        """Start the unit of work."""
         return self
 
     def __exit__(self, *args):
+        """End the unit of work, rolling back anything not committed."""
         self.rollback()
 
     def commit(self):
+        """Persist all changes made inside the block."""
         self._commit()
 
     def collect_new_events(self):
         # The UoW no longer publishes; the message bus pulls events from it.
+        """Yield, and remove, the events recorded by the products used in this unit of work.
+
+        The bus pulls from here after each handler, so events are processed in the order they occur.
+        """
         for product in self.products.seen:
             while product.events:
                 yield product.events.pop(0)
 
     @abc.abstractmethod
     def _commit(self):
+        """Persist changes. Implemented by subclasses."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def rollback(self):
+        """Discard all uncommitted changes."""
         raise NotImplementedError
 
 
 class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
+    """Unit of work backed by a SQLAlchemy session.
+
+    A new session is opened on entering the block and closed on leaving it, so one unit of work
+    is one transaction.
+
+    Args:
+        session_factory: Callable that returns a new SQLAlchemy session.
+    """
+
     def __init__(self, session_factory):
         self.session_factory = session_factory
 
     def __enter__(self):
+        """Open a new session and the repository that uses it."""
         self.session = self.session_factory()
         self.products = repository.SqlAlchemyRepository(self.session)
         return super().__enter__()
 
     def __exit__(self, *args):
+        """Roll back anything not committed, then close the session."""
         super().__exit__(*args)
         self.session.close()
 
     def _commit(self):
+        """Commit the session."""
         self.session.commit()
 
     def rollback(self):
+        """Roll back the session."""
         self.session.rollback()
 ```
 
 **📄 `src/allocation/adapters/repository.py`**
 
 ```python
+"""Repositories: the application's view of storage as a collection of aggregates."""
+
 import abc
 
 from allocation.adapters import orm
@@ -372,21 +481,30 @@ from allocation.domain import model
 
 
 class AbstractRepository(abc.ABC):
+    """The smallest storage interface the application needs, for products.
+
+    It remembers every product it hands out in ``seen``, so the unit of work can collect the
+    events those products recorded. Subclasses implement the underscore methods.
+    """
+
     def __init__(self):
         # every aggregate that passes through the repo; the UoW reads its events
         self.seen: set[model.Product] = set()
 
     def add(self, product: model.Product):
+        """Add a product to the collection."""
         self._add(product)
         self.seen.add(product)
 
     def get(self, sku) -> model.Product:
+        """Return the product for this SKU, or ``None`` if there is none."""
         product = self._get(sku)
         if product:
             self.seen.add(product)
         return product
 
     def get_by_batchref(self, batchref) -> model.Product:
+        """Return the product that owns this batch, or ``None``."""
         product = self._get_by_batchref(batchref)
         if product:
             self.seen.add(product)
@@ -394,29 +512,37 @@ class AbstractRepository(abc.ABC):
 
     @abc.abstractmethod
     def _add(self, product: model.Product):
+        """Store the product (called by ``add``)."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def _get(self, sku) -> model.Product:
+        """Look up a product by SKU (called by ``get``)."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def _get_by_batchref(self, batchref) -> model.Product:
+        """Look up a product by one of its batch references."""
         raise NotImplementedError
 
 
 class SqlAlchemyRepository(AbstractRepository):
+    """Repository backed by a SQLAlchemy session."""
+
     def __init__(self, session):
         super().__init__()
         self.session = session
 
     def _add(self, product):
+        """Add the product to the session."""
         self.session.add(product)
 
     def _get(self, sku):
+        """Query the product by SKU."""
         return self.session.query(model.Product).filter_by(sku=sku).first()
 
     def _get_by_batchref(self, batchref):
+        """Query the product that contains this batch."""
         return (
             self.session.query(model.Product)
             .join(model.Batch)
@@ -432,6 +558,12 @@ class SqlAlchemyRepository(AbstractRepository):
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: translates requests into messages for the bus and back.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from datetime import date
 
 from fastapi import FastAPI, HTTPException
@@ -444,6 +576,15 @@ from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
 class AddBatchRequest(BaseModel):
+    """Body of ``POST /add_batch``.
+
+    Attributes:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased. Must be greater than zero.
+        eta: Arrival date, or ``null`` for warehouse stock.
+    """
+
     ref: str
     sku: str
     qty: int = Field(gt=0)
@@ -451,16 +592,39 @@ class AddBatchRequest(BaseModel):
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
 class AllocateResponse(BaseModel):
+    """Body returned by ``POST /allocate``.
+
+    Attributes:
+        batchref: Reference of the batch the line was allocated to.
+    """
+
     batchref: str
 
 
 def create_app(session_factory=None) -> FastAPI:
+    """Build the FastAPI application.
+
+    Args:
+        session_factory: Creates database sessions. Tests pass a throwaway database; when
+            omitted, the real one from the settings is used.
+
+    Returns:
+        The configured application.
+    """
     if session_factory is None:
         orm.start_mappers()
         session_factory = orm.make_session_factory(config.get_settings().db_uri)
@@ -469,14 +633,20 @@ def create_app(session_factory=None) -> FastAPI:
 
     def new_uow():
         # one UoW per request: sessions are never shared between threads
+        """Build a unit of work for one request. They are never shared between threads."""
         return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
     @app.post("/add_batch", status_code=201)
     def add_batch_endpoint(body: AddBatchRequest) -> None:
+        """Add a batch of stock, creating its product if the SKU is new."""
         messagebus.handle(events.BatchCreated(body.ref, body.sku, body.qty, body.eta), new_uow())
 
     @app.post("/allocate", status_code=201)
     def allocate_endpoint(body: AllocateRequest) -> AllocateResponse:
+        """Allocate an order line to a batch.
+
+        Returns 201 with the batch reference, or 400 if the SKU is unknown or out of stock.
+        """
         try:
             results = messagebus.handle(
                 events.AllocationRequired(body.orderid, body.sku, body.qty), new_uow()

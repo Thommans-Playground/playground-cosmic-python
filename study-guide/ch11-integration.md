@@ -122,16 +122,23 @@ The bus is the single doorway, so Redis is just two more thin adapters around it
 **📄 `src/allocation/config.py`**
 
 ```python
+"""Typed application settings, read from the environment."""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed settings, read from environment variables (DB_URI=...) or a .env file.
+    """Application settings.
 
-    Invalid values (REDIS_PORT=banana) fail at startup with a clear error,
-    not later when something first tries to connect.
+    Each field can be set with an environment variable of the same name (``DB_URI``,
+    ``REDIS_PORT``, ...) or in a ``.env`` file. Invalid values fail at startup.
+
+    Attributes:
+        db_uri: SQLAlchemy database URL. Defaults to a local SQLite file.
+        redis_host: Host of the Redis server used for messaging between services.
+        redis_port: Port of the Redis server.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -143,6 +150,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return the settings, reading the environment once and caching the result."""
     return Settings()
 ```
 
@@ -155,6 +163,8 @@ def get_settings() -> Settings:
 **📄 `src/allocation/adapters/redis_eventpublisher.py`**
 
 ```python
+"""Publish domain events to Redis so other services can react to them."""
+
 import json
 import logging
 from dataclasses import asdict
@@ -173,6 +183,15 @@ r = redis.Redis(host=_settings.redis_host, port=_settings.redis_port)
 
 
 def publish(channel, event: events.Event):
+    """Publish ``event`` as JSON on a Redis channel.
+
+    The JSON shape is a contract with other services: renaming an event field is a breaking
+    change for every subscriber.
+
+    Args:
+        channel: Name of the Redis channel.
+        event: The event to publish. Must be a dataclass instance.
+    """
     logger.info("publishing: channel=%s, event=%s", channel, event)
     r.publish(channel, json.dumps(asdict(event)))
 ```
@@ -188,6 +207,12 @@ def publish(channel, event: events.Event):
 from allocation.adapters import email, redis_eventpublisher    # extended import
 
 def publish_allocated_event(event: events.Allocated, uow: unit_of_work.AbstractUnitOfWork):
+    """Tell other services, via Redis, that a line was allocated.
+
+    Args:
+        event: The allocation that just happened.
+        uow: Unused here; the bus passes it to every handler.
+    """
     redis_eventpublisher.publish("line_allocated", event)
 ```
 
@@ -301,6 +326,11 @@ class TestPublishing:
 **📄 `src/allocation/entrypoints/redis_eventconsumer.py`**
 
 ```python
+"""Listen for messages from other services on Redis and turn them into commands.
+
+The other service's wire format stays at this edge; nothing inside knows about it.
+"""
+
 import logging
 
 import redis
@@ -315,13 +345,19 @@ logger = logging.getLogger(__name__)
 
 
 class ChangeBatchQuantityMessage(BaseModel):
-    """The other service's wire format, validated at the edge before it becomes a command."""
+    """The ``change_batch_quantity`` message, as sent by the other service.
+
+    Attributes:
+        batchref: Reference of the batch that changed.
+        qty: Its new purchased quantity.
+    """
 
     batchref: str
     qty: int = Field(ge=0)
 
 
 def main():
+    """Subscribe to ``change_batch_quantity`` and handle messages until stopped."""
     orm.start_mappers()
     settings = config.get_settings()
     session_factory = orm.make_session_factory(settings.db_uri)
@@ -334,6 +370,14 @@ def main():
 
 
 def handle_change_batch_quantity(m, uow):
+    """Validate one Redis message and handle it as a ``ChangeBatchQuantity`` command.
+
+    Malformed messages are logged and dropped rather than crashing the consumer.
+
+    Args:
+        m: The raw Redis pub/sub message; its ``data`` holds the JSON payload.
+        uow: The unit of work to run the command in.
+    """
     logger.info("handling %s", m)
     try:
         msg = ChangeBatchQuantityMessage.model_validate_json(m["data"])
@@ -379,7 +423,7 @@ The e2e test adds two batches, allocates an order to the earlier one, publishes 
 
 ```python
 """End-to-end test of the Redis integration. Needs the whole stack running:
-Postgres + Redis + the FastAPI app + `python -m allocation.entrypoints.redis_eventconsumer`.
+Postgres + Redis + the Flask API + `python -m allocation.entrypoints.redis_eventconsumer`.
 Skipped unless API_URL is set, e.g.  API_URL=http://localhost:5000 pytest tests/e2e
 """
 

@@ -142,6 +142,12 @@ Key points to understand in the code:
 **📄 `src/allocation/adapters/orm.py`**
 
 ```python
+"""Database tables and the mapping from the plain domain classes onto them.
+
+The dependency points inwards: this module imports the model, and the model knows nothing
+about SQLAlchemy.
+"""
+
 from sqlalchemy import Column, Date, ForeignKey, Integer, String, Table
 from sqlalchemy.orm import registry, relationship
 
@@ -180,6 +186,11 @@ allocations = Table(
 
 def start_mappers():
     # The ORM depends on the model, not the other way round.
+    """Map the domain classes onto the tables.
+
+    Call this once per process, before using any session. It is a function, not import-time
+    code, so tests that only need the model never touch the ORM.
+    """
     lines_mapper = mapper_registry.map_imperatively(model.OrderLine, order_lines)
     mapper_registry.map_imperatively(
         model.Batch,
@@ -340,32 +351,46 @@ Run `pytest tests/integration/test_orm.py`. It fails until `orm.py` exists, then
 **📄 `src/allocation/adapters/repository.py`**
 
 ```python
+"""Repositories: the application's view of storage as a collection of aggregates."""
+
 import abc
 
 from allocation.domain import model
 
 
 class AbstractRepository(abc.ABC):
+    """The smallest storage interface the application needs, for batches.
+
+    Implemented by the real SQLAlchemy repository and by an in-memory fake in tests.
+    """
+
     @abc.abstractmethod
     def add(self, batch: model.Batch):
+        """Add a batch to the collection."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def get(self, reference) -> model.Batch:
+        """Return the batch with this reference."""
         raise NotImplementedError
 
 
 class SqlAlchemyRepository(AbstractRepository):
+    """Repository backed by a SQLAlchemy session."""
+
     def __init__(self, session):
         self.session = session
 
     def add(self, batch):
+        """Add a batch to the session."""
         self.session.add(batch)
 
     def get(self, reference):
+        """Return the batch with this reference."""
         return self.session.query(model.Batch).filter_by(reference=reference).one()
 
     def list(self):
+        """Return every batch."""
         return self.session.query(model.Batch).all()
 ```
 

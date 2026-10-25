@@ -140,13 +140,23 @@ allocations_view = Table(
 **📄 `src/allocation/views.py`**
 
 ```python
+"""The query side: reads that skip the domain model and use plain SQL on the read model."""
+
 from sqlalchemy import text
 
 from allocation.service_layer import unit_of_work
 
 
 def allocations(orderid: str, uow: unit_of_work.AbstractUnitOfWork):
-    """The query side: plain SQL against the read model, no domain objects."""
+    """Return where each line of an order was allocated.
+
+    Args:
+        orderid: The order to look up.
+        uow: Provides the database session.
+
+    Returns:
+        A list of ``{"sku": ..., "batchref": ...}`` dicts, ordered by SKU. Empty if none.
+    """
     with uow:
         results = uow.session.execute(
             text(
@@ -163,10 +173,22 @@ def allocations(orderid: str, uow: unit_of_work.AbstractUnitOfWork):
 
 ```python
 def reallocate(event: events.Deallocated, uow):
+    """Allocate again a line that lost its batch.
+
+    Args:
+        event: The line that was deallocated.
+        uow: The unit of work that wraps the transaction.
+    """
     allocate(commands.Allocate(**asdict(event)), uow=uow)
 
 
 def add_allocation_to_read_model(event: events.Allocated, uow):
+    """Record an allocation in the read model that serves ``GET /allocations``.
+
+    Args:
+        event: The allocation that just happened.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         uow.session.execute(
             text("INSERT INTO allocations_view (orderid, sku, batchref)"
@@ -177,6 +199,12 @@ def add_allocation_to_read_model(event: events.Allocated, uow):
 
 
 def remove_allocation_from_read_model(event: events.Deallocated, uow):
+    """Remove a deallocated line from the read model.
+
+    Args:
+        event: The line that lost its allocation.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         uow.session.execute(
             text("DELETE FROM allocations_view WHERE orderid = :orderid AND sku = :sku"),
@@ -230,6 +258,12 @@ What's new in the entrypoint: `status_code=202` on the POST, a `GET /allocations
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: sends commands to the bus and serves reads from the read model.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from datetime import date
 
 from fastapi import FastAPI, HTTPException
@@ -242,6 +276,15 @@ from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
 class AddBatchRequest(BaseModel):
+    """Body of ``POST /add_batch``.
+
+    Attributes:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased. Must be greater than zero.
+        eta: Arrival date, or ``null`` for warehouse stock.
+    """
+
     ref: str
     sku: str
     qty: int = Field(gt=0)
@@ -249,21 +292,41 @@ class AddBatchRequest(BaseModel):
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
-class AllocateResponse(BaseModel):
-    batchref: str
-
-
 class AllocationOut(BaseModel):
+    """One allocation, as returned by ``GET /allocations/{orderid}``.
+
+    Attributes:
+        sku: The product.
+        batchref: Reference of the batch the line is allocated to.
+    """
+
     sku: str
     batchref: str
 
 
 def create_app(session_factory=None) -> FastAPI:
+    """Build the FastAPI application.
+
+    Args:
+        session_factory: Creates database sessions. Tests pass a throwaway database; when
+            omitted, the real one from the settings is used.
+
+    Returns:
+        The configured application.
+    """
     if session_factory is None:
         orm.start_mappers()
         session_factory = orm.make_session_factory(config.get_settings().db_uri)
@@ -272,14 +335,21 @@ def create_app(session_factory=None) -> FastAPI:
 
     def new_uow():
         # one UoW per request: sessions are never shared between threads
+        """Build a unit of work for one request. They are never shared between threads."""
         return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
     @app.post("/add_batch", status_code=201)
     def add_batch_endpoint(body: AddBatchRequest) -> None:
+        """Add a batch of stock, creating its product if the SKU is new."""
         messagebus.handle(commands.CreateBatch(body.ref, body.sku, body.qty, body.eta), new_uow())
 
     @app.post("/allocate", status_code=202)
     def allocate_endpoint(body: AllocateRequest) -> None:
+        """Accept a request to allocate an order line.
+
+        Returns 202 straight away; read the result from ``GET /allocations/{orderid}``. Returns 400
+        if the SKU is unknown.
+        """
         try:
             messagebus.handle(commands.Allocate(body.orderid, body.sku, body.qty), new_uow())
         except handlers.InvalidSku as e:
@@ -287,6 +357,7 @@ def create_app(session_factory=None) -> FastAPI:
 
     @app.get("/allocations/{orderid}")
     def allocations_endpoint(orderid: str) -> list[AllocationOut]:
+        """Return where each line of an order was allocated, or 404 if there are none."""
         result = views.allocations(orderid, new_uow())
         if not result:
             raise HTTPException(status_code=404, detail="not found")

@@ -240,41 +240,83 @@ def test_allocation_is_idempotent():
 **📄 `src/allocation/domain/model.py`**
 
 ```python
+"""Domain model for the allocation service.
+
+Plain Python only: nothing in this module imports a web framework, an ORM or a database
+driver. That is what lets the business rules be tested in milliseconds and reused unchanged
+behind any entrypoint.
+
+The model is organised around one aggregate, ``Product``: every ``Batch`` of a SKU is changed
+through it, so the SKU's stock is always updated as one consistent unit.
+"""
+
 from dataclasses import dataclass
 from datetime import date
 
 
 class OutOfStock(Exception):
+    """Raised when no batch can take an order line."""
+
     pass
 
 
 @dataclass(unsafe_hash=True)
 class OrderLine:
+    """One line of a customer order: a quantity of one SKU.
+
+    A value object: two lines with the same fields are the same line. Treat it as immutable.
+    It is hashable so that a ``Batch`` can keep its allocated lines in a ``set``.
+
+    Attributes:
+        orderid: Identifier of the customer order this line belongs to.
+        sku: Stock-keeping unit: the product being ordered.
+        qty: How many units are wanted.
+    """
+
     orderid: str
     sku: str
     qty: int
 
 
 class Batch:
+    """A quantity of one SKU bought from a supplier, either in the warehouse or on its way.
+
+    An entity: identified by its ``reference``, whatever its current quantity or allocations.
+
+    Args:
+        ref: Unique reference of this batch.
+        sku: The product this batch contains.
+        qty: Quantity purchased. The quantity still available is derived, never stored.
+        eta: Arrival date for a shipment, or ``None`` for stock already in the warehouse.
+    """
+
     def __init__(self, ref: str, sku: str, qty: int, eta: date | None):
         self.reference = ref
         self.sku = sku
         self.eta = eta
         self._purchased_quantity = qty
+        # A set, so allocating an equal line twice is a no-op: allocation is idempotent.
         self._allocations: set[OrderLine] = set()
 
     def __repr__(self):
         return f"<Batch {self.reference}>"
 
     def __eq__(self, other):
+        """Batches are equal when their reference is equal, regardless of their state."""
         if not isinstance(other, Batch):
             return False
         return other.reference == self.reference
 
     def __hash__(self):
+        """Hash by reference only, so it stays consistent with ``__eq__``."""
         return hash(self.reference)
 
     def __gt__(self, other):
+        """Order batches by how soon their stock can ship.
+
+        Warehouse stock (``eta is None``) sorts first, then the earliest ETA. This is how
+        ``sorted(batches)`` expresses the business preference rule.
+        """
         if self.eta is None:
             return False
         if other.eta is None:
@@ -282,27 +324,50 @@ class Batch:
         return self.eta > other.eta
 
     def allocate(self, line: OrderLine):
+        """Reserve ``line`` in this batch.
+
+        Does nothing if the line does not fit or is already allocated, so repeating a request
+        (a double submit, a retry) is harmless.
+        """
         if self.can_allocate(line):
             self._allocations.add(line)
 
     def deallocate(self, line: OrderLine):
+        """Release a previously allocated line. Lines that were never allocated are ignored."""
         if line in self._allocations:
             self._allocations.remove(line)
 
     @property
     def allocated_quantity(self) -> int:
+        """Total quantity of the lines allocated to this batch."""
         return sum(line.qty for line in self._allocations)
 
     @property
     def available_quantity(self) -> int:
+        """Purchased quantity minus allocated quantity.
+
+        Computed on demand, so it can never drift out of sync with the allocations.
+        """
         return self._purchased_quantity - self.allocated_quantity
 
     def can_allocate(self, line: OrderLine) -> bool:
+        """Return whether ``line`` is for this batch's SKU and fits in the available quantity."""
         return self.sku == line.sku and self.available_quantity >= line.qty
 
 
 class Product:
-    """Aggregate root: all the batches for one SKU, changed only through here."""
+    """Aggregate root: every batch of one SKU, and the only way to change them.
+
+    All allocation decisions for a SKU go through this object, so the rules (preference order,
+    never over-allocating) are enforced in one place, and the product is the unit that gets
+    loaded, changed and saved in a single transaction.
+
+    Args:
+        sku: The product this aggregate represents.
+        batches: All batches of that SKU.
+        version_number: Incremented on every allocation. The database uses it to detect two
+            requests changing the same product at the same time.
+    """
 
     def __init__(self, sku: str, batches: list[Batch], version_number: int = 0):
         self.sku = sku
@@ -310,12 +375,26 @@ class Product:
         self.version_number = version_number
 
     def allocate(self, line: OrderLine) -> str:
+        """Allocate ``line`` to the best available batch of this SKU.
+
+        Args:
+            line: The order line to allocate.
+
+        Returns:
+            The reference of the chosen batch.
+
+        Raises:
+            OutOfStock: If no batch can take the line.
+        """
         try:
+            # sorted() uses Batch.__gt__, so the first batch that fits is the preferred one.
             batch = next(b for b in sorted(self.batches) if b.can_allocate(line))
             batch.allocate(line)
+            # The database uses the version to detect two requests changing this product at once.
             self.version_number += 1
             return batch.reference
         except StopIteration:
+            # `from None` hides the internal StopIteration from the traceback.
             raise OutOfStock(f"Out of stock for sku {line.sku}") from None
 ```
 
@@ -326,6 +405,12 @@ class Product:
 **📄 `src/allocation/adapters/orm.py`**
 
 ```python
+"""Database tables and the mapping from the plain domain classes onto them.
+
+The dependency points inwards: this module imports the model, and the model knows nothing
+about SQLAlchemy.
+"""
+
 from sqlalchemy import Column, Date, ForeignKey, Integer, String, Table, create_engine
 from sqlalchemy.orm import registry, relationship, sessionmaker
 
@@ -370,6 +455,11 @@ allocations = Table(
 
 
 def start_mappers():
+    """Map the domain classes onto the tables.
+
+    Call this once per process, before using any session. It is a function, not import-time
+    code, so tests that only need the model never touch the ORM.
+    """
     lines_mapper = mapper_registry.map_imperatively(model.OrderLine, order_lines)
     batches_mapper = mapper_registry.map_imperatively(
         model.Batch,
@@ -388,7 +478,17 @@ def start_mappers():
 
 
 def make_session_factory(uri: str) -> sessionmaker:
-    """Engine + tables + session factory. Postgres needs REPEATABLE READ (see ch07)."""
+    """Create the engine, make sure the tables exist, and return a session factory.
+
+    Postgres runs at ``REPEATABLE READ`` so two requests changing the same product conflict
+    instead of both succeeding. SQLite does not accept that setting, hence the check.
+
+    Args:
+        uri: SQLAlchemy database URL, for example ``sqlite:///allocation.db``.
+
+    Returns:
+        A ``sessionmaker`` bound to the new engine.
+    """
     kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
     engine = create_engine(uri, **kwargs)
     metadata.create_all(engine)
@@ -402,29 +502,43 @@ def make_session_factory(uri: str) -> sessionmaker:
 **📄 `src/allocation/adapters/repository.py`**
 
 ```python
+"""Repositories: the application's view of storage as a collection of aggregates."""
+
 import abc
 
 from allocation.domain import model
 
 
 class AbstractRepository(abc.ABC):
+    """The smallest storage interface the application needs, for products.
+
+    Only aggregate roots get a repository. Implemented by the real SQLAlchemy repository and by
+    an in-memory fake in tests.
+    """
+
     @abc.abstractmethod
     def add(self, product: model.Product):
+        """Add a product to the collection."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def get(self, sku) -> model.Product:
+        """Return the product for this SKU, or ``None`` if there is none."""
         raise NotImplementedError
 
 
 class SqlAlchemyRepository(AbstractRepository):
+    """Repository backed by a SQLAlchemy session."""
+
     def __init__(self, session):
         self.session = session
 
     def add(self, product):
+        """Add a product to the session."""
         self.session.add(product)
 
     def get(self, sku):
+        """Return the product for this SKU, or ``None``."""
         return self.session.query(model.Product).filter_by(sku=sku).first()
 ```
 
@@ -497,6 +611,12 @@ session.execute(text('INSERT INTO products (sku, version_number) VALUES ("sku1",
 **📄 `src/allocation/service_layer/services.py`**
 
 ```python
+"""Application services: one function per use case.
+
+Services orchestrate (fetch, call the domain, commit); the business rules stay in the model.
+They take plain values, never web objects, so any entrypoint can call them.
+"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -506,6 +626,8 @@ from allocation.service_layer import unit_of_work
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
@@ -516,6 +638,15 @@ def add_batch(
     eta: date | None,
     uow: unit_of_work.AbstractUnitOfWork,
 ):
+    """Add a batch of stock, creating the product the first time its SKU appears.
+
+    Args:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased.
+        eta: Arrival date, or ``None`` for warehouse stock.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get(sku=sku)
         if product is None:
@@ -526,6 +657,21 @@ def add_batch(
 
 
 def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
+    """Allocate an order line to a batch, inside one unit of work.
+
+    Args:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units.
+        uow: The unit of work that wraps the transaction.
+
+    Returns:
+        The reference of the batch that was allocated.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+        OutOfStock: If no batch can take the line.
+    """
     line = model.OrderLine(orderid, sku, qty)
     with uow:
         product = uow.products.get(sku=line.sku)
@@ -627,7 +773,17 @@ Postgres needs `REPEATABLE READ`, but SQLite rejects that value, hence the `if`.
 ```python
 # orm.py (add `create_engine` and `sessionmaker` to the imports)
 def make_session_factory(uri: str) -> sessionmaker:
-    """Engine + tables + session factory. Postgres needs REPEATABLE READ (see ch07)."""
+    """Create the engine, make sure the tables exist, and return a session factory.
+
+    Postgres runs at ``REPEATABLE READ`` so two requests changing the same product conflict
+    instead of both succeeding. SQLite does not accept that setting, hence the check.
+
+    Args:
+        uri: SQLAlchemy database URL, for example ``sqlite:///allocation.db``.
+
+    Returns:
+        A ``sessionmaker`` bound to the new engine.
+    """
     kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
     engine = create_engine(uri, **kwargs)
     metadata.create_all(engine)

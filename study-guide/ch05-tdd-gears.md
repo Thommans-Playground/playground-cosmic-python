@@ -223,6 +223,12 @@ def test_prefers_warehouse_batches_to_shipments():
 **📄 `src/allocation/service_layer/services.py`**
 
 ```python
+"""Application services: one function per use case.
+
+Services orchestrate (fetch, call the domain, commit); the business rules stay in the model.
+They take plain values, never web objects, so any entrypoint can call them.
+"""
+
 from datetime import date
 
 from allocation.adapters import repository
@@ -230,10 +236,13 @@ from allocation.domain import model
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
 def is_valid_sku(sku, batches):
+    """Return whether any of ``batches`` is for ``sku``."""
     return sku in {b.sku for b in batches}
 
 
@@ -245,11 +254,37 @@ def add_batch(
     repo: repository.AbstractRepository,
     session,
 ):
+    """Add a batch of stock.
+
+    Args:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased.
+        eta: Arrival date, or ``None`` for warehouse stock.
+        repo: Where batches are stored.
+        session: The database session to commit.
+    """
     repo.add(model.Batch(ref, sku, qty, eta))
     session.commit()
 
 
 def allocate(orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session) -> str:
+    """Allocate an order line to a batch.
+
+    Args:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units.
+        repo: Where batches are stored.
+        session: The database session to commit.
+
+    Returns:
+        The reference of the batch that was allocated.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+        OutOfStock: If no batch can take the line.
+    """
     line = model.OrderLine(orderid, sku, qty)
     batches = repo.list()
     if not is_valid_sku(line.sku, batches):
@@ -260,6 +295,18 @@ def allocate(orderid: str, sku: str, qty: int, repo: repository.AbstractReposito
 
 
 def deallocate(orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session):
+    """Release an order line from whichever batch holds it.
+
+    Args:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units.
+        repo: Where batches are stored.
+        session: The database session to commit.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+    """
     line = model.OrderLine(orderid, sku, qty)
     batches = repo.list()
     if not is_valid_sku(line.sku, batches):
@@ -280,6 +327,12 @@ Pydantic does the date handling here: `AddBatchRequest.eta` is typed `date | Non
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: translates requests into calls to the service layer and back.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from collections.abc import Iterator
 from datetime import date
 from typing import Annotated
@@ -296,6 +349,15 @@ from allocation.service_layer import services
 
 
 class AddBatchRequest(BaseModel):
+    """Body of ``POST /add_batch``.
+
+    Attributes:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased. Must be greater than zero.
+        eta: Arrival date, or ``null`` for warehouse stock.
+    """
+
     ref: str
     sku: str
     qty: int = Field(gt=0)
@@ -303,16 +365,39 @@ class AddBatchRequest(BaseModel):
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
 class AllocateResponse(BaseModel):
+    """Body returned by ``POST /allocate``.
+
+    Attributes:
+        batchref: Reference of the batch the line was allocated to.
+    """
+
     batchref: str
 
 
 def create_app(session_factory=None) -> FastAPI:
+    """Build the FastAPI application.
+
+    Args:
+        session_factory: Creates database sessions. Tests pass a throwaway database; when
+            omitted, the real one from the settings is used.
+
+    Returns:
+        The configured application.
+    """
     if session_factory is None:
         engine = create_engine(config.get_settings().db_uri)
         orm.metadata.create_all(engine)
@@ -322,6 +407,7 @@ def create_app(session_factory=None) -> FastAPI:
     app = FastAPI(title="Allocation service")
 
     def get_session() -> Iterator[Session]:
+        """Yield a session for one request and always close it afterwards."""
         session = session_factory()
         try:
             yield session
@@ -332,11 +418,16 @@ def create_app(session_factory=None) -> FastAPI:
 
     @app.post("/add_batch", status_code=201)
     def add_batch_endpoint(body: AddBatchRequest, session: DbSession) -> None:
+        """Add a batch of stock, creating its product if the SKU is new."""
         repo = repository.SqlAlchemyRepository(session)
         services.add_batch(body.ref, body.sku, body.qty, body.eta, repo, session)
 
     @app.post("/allocate", status_code=201)
     def allocate_endpoint(body: AllocateRequest, session: DbSession) -> AllocateResponse:
+        """Allocate an order line to a batch.
+
+        Returns 201 with the batch reference, or 400 if the SKU is unknown or out of stock.
+        """
         repo = repository.SqlAlchemyRepository(session)
         try:
             batchref = services.allocate(body.orderid, body.sku, body.qty, repo, session)

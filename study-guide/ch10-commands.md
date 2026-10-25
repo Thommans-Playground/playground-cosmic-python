@@ -104,16 +104,25 @@ handler(message)                                      # any handler error reache
 **📄 `src/allocation/domain/commands.py`**
 
 ```python
+"""Commands: requests to do something, named in the imperative.
+
+Unlike events, a command has exactly one handler, and a failure is reported to the sender.
+"""
+
 from dataclasses import dataclass
 from datetime import date
 
 
 class Command:
+    """Base class for commands."""
+
     pass
 
 
 @dataclass
 class Allocate(Command):
+    """Allocate an order line to a batch of the matching SKU."""
+
     orderid: str
     sku: str
     qty: int
@@ -121,6 +130,8 @@ class Allocate(Command):
 
 @dataclass
 class CreateBatch(Command):
+    """Record a new batch of stock, creating its product if needed."""
+
     ref: str
     sku: str
     qty: int
@@ -129,6 +140,8 @@ class CreateBatch(Command):
 
 @dataclass
 class ChangeBatchQuantity(Command):
+    """Change a batch's purchased quantity, for example after a damaged shipment."""
+
     ref: str
     qty: int
 ```
@@ -136,15 +149,24 @@ class ChangeBatchQuantity(Command):
 **📄 `src/allocation/domain/events.py`**
 
 ```python
+"""Domain events: facts about something that has already happened, named in the past tense.
+
+The model records them; handlers react to them. Nothing here knows who is listening.
+"""
+
 from dataclasses import dataclass
 
 
 class Event:
+    """Base class for domain events."""
+
     pass
 
 
 @dataclass
 class Allocated(Event):
+    """An order line was allocated to a batch."""
+
     orderid: str
     sku: str
     qty: int
@@ -153,6 +175,8 @@ class Allocated(Event):
 
 @dataclass
 class OutOfStock(Event):
+    """A SKU could not be allocated because no batch has enough stock."""
+
     sku: str
 ```
 
@@ -196,6 +220,12 @@ def test_records_allocated_event():
 **📄 `src/allocation/service_layer/handlers.py`**
 
 ```python
+"""Message handlers: one function per use case or reaction.
+
+Command handlers do the work a sender asked for. Event handlers react to facts. Each takes
+the message plus a unit of work and returns a result only if the caller needs one.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -209,10 +239,18 @@ if TYPE_CHECKING:
 
 
 class InvalidSku(Exception):
+    """Raised when an order refers to a SKU we do not stock."""
+
     pass
 
 
 def add_batch(cmd: commands.CreateBatch, uow: unit_of_work.AbstractUnitOfWork):
+    """Record a new batch, creating its product the first time its SKU appears.
+
+    Args:
+        cmd: Describes the new batch.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get(sku=cmd.sku)
         if product is None:
@@ -223,6 +261,18 @@ def add_batch(cmd: commands.CreateBatch, uow: unit_of_work.AbstractUnitOfWork):
 
 
 def allocate(cmd: commands.Allocate, uow: unit_of_work.AbstractUnitOfWork):
+    """Allocate an order line.
+
+    Args:
+        cmd: Describes the order line.
+        uow: The unit of work that wraps the transaction.
+
+    Returns:
+        The reference of the chosen batch, or ``None`` if the SKU is out of stock.
+
+    Raises:
+        InvalidSku: If the SKU is not one we stock.
+    """
     line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
     with uow:
         product = uow.products.get(sku=line.sku)
@@ -234,6 +284,12 @@ def allocate(cmd: commands.Allocate, uow: unit_of_work.AbstractUnitOfWork):
 
 
 def change_batch_quantity(cmd: commands.ChangeBatchQuantity, uow: unit_of_work.AbstractUnitOfWork):
+    """Change a batch's quantity; the product bumps and re-queues any lines that no longer fit.
+
+    Args:
+        cmd: Names the batch and its new quantity.
+        uow: The unit of work that wraps the transaction.
+    """
     with uow:
         product = uow.products.get_by_batchref(batchref=cmd.ref)
         product.change_batch_quantity(ref=cmd.ref, qty=cmd.qty)
@@ -242,6 +298,12 @@ def change_batch_quantity(cmd: commands.ChangeBatchQuantity, uow: unit_of_work.A
 
 # --- event handlers: reactions to facts, no return value -----------------
 def send_out_of_stock_notification(event: events.OutOfStock, uow: unit_of_work.AbstractUnitOfWork):
+    """Email the purchasing team that a SKU ran out.
+
+    Args:
+        event: The out-of-stock event.
+        uow: Unused here; the bus passes it to every handler.
+    """
     email.send(
         "stock@made.com",
         f"Out of stock for {event.sku}",
@@ -262,6 +324,12 @@ def send_out_of_stock_notification(event: events.OutOfStock, uow: unit_of_work.A
 **📄 `src/allocation/service_layer/messagebus.py`**
 
 ```python
+"""The message bus: routes commands and events to their handlers.
+
+A command has exactly one handler and its errors reach the caller. An event has any number of
+handlers and their errors are logged, so one failing listener cannot break the others.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -281,6 +349,15 @@ Message = commands.Command | events.Event
 
 
 def handle(message: Message, uow: unit_of_work.AbstractUnitOfWork):
+    """Handle a message, then every message its handlers cause, in order.
+
+    Args:
+        message: The first command or event to handle.
+        uow: The unit of work given to every handler.
+
+    Returns:
+        The results of the commands that ran, in order.
+    """
     results = []
     queue = [message]
     while queue:
@@ -300,6 +377,13 @@ def handle_event(
     queue: list[Message],
     uow: unit_of_work.AbstractUnitOfWork,
 ):
+    """Run every handler for ``event``, logging errors instead of raising them.
+
+    Args:
+        event: The event to handle.
+        queue: Where follow-up messages are appended.
+        uow: The unit of work given to every handler.
+    """
     for handler in EVENT_HANDLERS[type(event)]:
         try:
             logger.debug("handling event %s with handler %s", event, handler)
@@ -317,6 +401,19 @@ def handle_command(
     queue: list[Message],
     uow: unit_of_work.AbstractUnitOfWork,
 ):
+    """Run the single handler for ``command``.
+
+    Args:
+        command: The command to handle.
+        queue: Where follow-up messages are appended.
+        uow: The unit of work given to the handler.
+
+    Returns:
+        Whatever the handler returned.
+
+    Raises:
+        Exception: Any error from the handler is logged and re-raised to the sender.
+    """
     logger.debug("handling command %s", command)
     try:
         handler = COMMAND_HANDLERS[type(command)]
@@ -348,6 +445,12 @@ COMMAND_HANDLERS: dict[type[commands.Command], Callable] = {
 **📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
+"""The HTTP entrypoint: translates requests into messages for the bus and back.
+
+No business logic lives here. Pydantic models validate what comes in; domain and service
+errors are turned into HTTP status codes.
+"""
+
 from datetime import date
 
 from fastapi import FastAPI, HTTPException
@@ -360,6 +463,15 @@ from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
 class AddBatchRequest(BaseModel):
+    """Body of ``POST /add_batch``.
+
+    Attributes:
+        ref: Unique reference of the new batch.
+        sku: The product the batch contains.
+        qty: Quantity purchased. Must be greater than zero.
+        eta: Arrival date, or ``null`` for warehouse stock.
+    """
+
     ref: str
     sku: str
     qty: int = Field(gt=0)
@@ -367,16 +479,39 @@ class AddBatchRequest(BaseModel):
 
 
 class AllocateRequest(BaseModel):
+    """Body of ``POST /allocate``.
+
+    Attributes:
+        orderid: The customer order the line belongs to.
+        sku: The product ordered.
+        qty: How many units. Must be greater than zero.
+    """
+
     orderid: str
     sku: str
     qty: int = Field(gt=0)
 
 
 class AllocateResponse(BaseModel):
+    """Body returned by ``POST /allocate``.
+
+    Attributes:
+        batchref: Reference of the batch the line was allocated to.
+    """
+
     batchref: str
 
 
 def create_app(session_factory=None) -> FastAPI:
+    """Build the FastAPI application.
+
+    Args:
+        session_factory: Creates database sessions. Tests pass a throwaway database; when
+            omitted, the real one from the settings is used.
+
+    Returns:
+        The configured application.
+    """
     if session_factory is None:
         orm.start_mappers()
         session_factory = orm.make_session_factory(config.get_settings().db_uri)
@@ -385,14 +520,20 @@ def create_app(session_factory=None) -> FastAPI:
 
     def new_uow():
         # one UoW per request: sessions are never shared between threads
+        """Build a unit of work for one request. They are never shared between threads."""
         return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
     @app.post("/add_batch", status_code=201)
     def add_batch_endpoint(body: AddBatchRequest) -> None:
+        """Add a batch of stock, creating its product if the SKU is new."""
         messagebus.handle(commands.CreateBatch(body.ref, body.sku, body.qty, body.eta), new_uow())
 
     @app.post("/allocate", status_code=201)
     def allocate_endpoint(body: AllocateRequest) -> AllocateResponse:
+        """Allocate an order line to a batch.
+
+        Returns 201 with the batch reference, or 400 if the SKU is unknown or out of stock.
+        """
         try:
             results = messagebus.handle(
                 commands.Allocate(body.orderid, body.sku, body.qty), new_uow()

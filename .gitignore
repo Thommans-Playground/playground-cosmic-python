@@ -1,0 +1,42 @@
+# Python bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments (uv keeps uv.lock tracked)
+.venv/
+venv/
+env/
+
+# Test / type / lint caches and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local databases (SQLite used in later chapters)
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code local-only files (skills in .claude/skills stay tracked)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
