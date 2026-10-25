@@ -6,6 +6,7 @@ behind any entrypoint.
 """
 
 from dataclasses import dataclass
+from datetime import date
 
 
 class OutOfStock(Exception):
@@ -14,8 +15,25 @@ class OutOfStock(Exception):
     pass
 
 
-def allocate():
-    pass
+def allocate(line: "OrderLine", batches: list["Batch"]) -> str:
+    """Allocate an order line to the best available batch.
+
+    "Best" is decided by ``Batch.__gt__``: warehouse stock first, then the earliest ETA.
+
+    Args:
+        line: The order line to allocate.
+        batches: Candidate batches. Batches for other SKUs are skipped by ``can_allocate``.
+
+    Returns:
+        The reference of the batch the line was allocated to.
+
+    Raises:
+        OutOfStock: If no batch can take the line.
+    """
+    try:
+        batch = next(b for b in sorted(batches) if b.cab_allocate(line))
+    except StopIteration:
+        raise OutOfStock(f"Out of stock for sku {line.sku}") from None
 
 
 @dataclass(unsafe_hash=True)
@@ -32,6 +50,8 @@ class OrderLine:
     """
 
     orderid: str
+    sku: str
+    qty: int
 
 
 class Batch:
@@ -46,5 +66,51 @@ class Batch:
         eta: Arrival date for a shipment, or ``None`` for stock already in the warehouse.
     """
 
-    def __init__(self):
+    def __init__(self, ref, sku, qty: int, eta: date | None):
+        self.reference = ref
+        self.sku = sku
+        self.eta = eta
+        self._purchased_quantity = qty
+
+        # A set, so allocating an equal line twice is a no-op: allocation is idempotent.
+        self._allocations: set[OrderLine] = set()
+
+    @property
+    def available_quantity(self) -> int:
+        """Purchased quantity minus allocated quantity.
+
+        Computed on demand, so it can never drift out of sync with the allocations.
+        """
         pass
+
+    def allocate(self, line: OrderLine):
+        """Reserve ``line`` in this batch.
+
+        Does nothing if the line does not fit or is already allocated, so repeating a request
+        (a double submit, a retry) is harmless.
+        """
+        if self.can_allocate(line):
+            self._allocations.add(line)
+
+    def can_allocate(self, line: OrderLine):
+        """Return whether ``line`` is for this batch's SKU and fits in the available quantity."""
+        return self.sku == line.sku and self.available_quantity >= line.quantity
+
+    def __repr__(self):
+        return f"<Batch {self.reference}>"
+
+    def __gt__(self, other):
+        pass
+
+    def __hash__(self):
+        """Hash by reference only, so it stays consistent with ``__eq__``."""
+        return hash(self.reference)
+
+    def __eq__(self, other):
+        """Batches are equal when their reference is equal,
+        regardless of their state."""
+
+        if not isinstance(other, Batch):
+            return False
+
+        return other.reference == self.reference
