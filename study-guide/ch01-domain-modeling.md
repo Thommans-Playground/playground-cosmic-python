@@ -55,6 +55,85 @@ flowchart TD
     C -- no --> E[raise OutOfStock]
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> For every addition in this chapter: what most people write first, where it breaks, what we do instead, and what the better way costs. Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: the allocation rule ("warehouse stock first, then earliest ETA")
+
+**The conventional way:** let the database pick, inside the web handler.
+
+```python
+@app.route("/allocate", methods=["POST"])
+def allocate():
+    batches = Batch.query.filter_by(sku=sku).order_by(Batch.eta).all()   # the rule lives in this ORDER BY
+    for b in batches:
+        if b.available >= qty:
+            b.available -= qty
+            db.session.commit()
+            return {"batchref": b.reference}, 201
+    return {"message": "out of stock"}, 400
+```
+
+**Where it breaks**
+- The business rule is now encoded in how a *database* orders `NULL`. Warehouse stock is `eta = NULL`. 🧪 SQLite sorts it first (`['warehouse', 'shipment']`). 📖 PostgreSQL sorts NULLs *last* in ascending order by default, so the same code would prefer shipments over stock in production. A rule that changes meaning with the database is a bug waiting for a migration.
+- The rule has no name and no home. The next feature (a CLI, a report, a nightly job) re-implements it slightly differently.
+- Testing it requires a database and a web client.
+
+**The better way** (Step 2): `Batch.__gt__` plus a plain `allocate()` function that does `sorted(batches)`.
+
+**Why it's right:** the rule is ordinary Python in one place, with a name, tested in milliseconds, and it behaves identically on every machine.
+**What it costs:** sorting happens in memory, so you load all batches for the SKU first. Fine for tens or hundreds; ch07's aggregates deliberately keep that set small.
+
+### Addition 2: equality (what makes two objects "the same")
+
+**The conventional way:** plain dataclasses for everything.
+
+```python
+@dataclass
+class Batch:
+    reference: str
+    qty: int
+    allocations: list = field(default_factory=list)
+
+@dataclass
+class OrderLine:
+    orderid: str
+    sku: str
+    qty: int
+```
+
+**Where it breaks**
+- 🧪 `Batch("b1", 100) == Batch("b1", 100)` becomes `False` as soon as one of them has an allocation. The *same* batch, observed twice, is "different".
+- 🧪 A non-frozen dataclass is unhashable: `{batch}` raises `TypeError: unhashable type`. The same goes for `OrderLine`, so you can't keep allocated lines in a `set`, and "allocating the same line twice does nothing" now needs hand-written list scanning.
+
+**The better way** (Step 2): `OrderLine` is a **value object** (equality by all fields, hashable). `Batch` is an **entity** (equality and hash by `reference` only).
+
+**Why it's right:** equality now matches what the business means: an order line *is* its contents; a batch *is* its reference, whatever its current state.
+**What it costs:** entity equality is shallow. `batch_a == batch_b` says nothing about quantities, so tests that care must compare fields explicitly (ch02 does exactly this).
+
+### Addition 3: "how much is left in a batch?"
+
+**The conventional way:** store a counter and decrement it.
+
+```python
+class Batch:
+    def __init__(self, qty):
+        self.available_quantity = qty
+
+    def allocate(self, line):
+        self.available_quantity -= line.qty
+```
+
+**Where it breaks**
+- 🧪 20 in stock, one order line of 10 submitted twice (a double-click, a retried request): the counter reads `0`. The truth is `10`.
+- Deallocation has to remember what to add back, and any code path that forgets leaves the number wrong forever. There are now two sources of truth: the counter and the real list of allocations.
+
+**The better way** (Step 2): store only `purchased_quantity` and a **set** of allocated lines; `available_quantity` is a computed property.
+
+**Why it's right:** a derived number can't drift from its inputs, and the set makes the double submit harmless with no extra code.
+**What it costs:** the number is recomputed (a sum over allocations) each time it's read. Irrelevant at this size; ch12 moves heavy reads somewhere else anyway.
+
 ## 🛬 1,000 ft: design decisions
 - A `@dataclass` gives value-object equality for free; `unsafe_hash=True` adds hashability so lines can live in a `set`. (The book uses `frozen=True`; see the version note in the code-along.)
 - `Batch` overrides `__eq__` and `__hash__` using `reference` only. Entity semantics.
@@ -67,27 +146,75 @@ flowchart TD
 
 > **How to use this section.** Do each step in order: read the *Do* and *Why*, **type** the code (don't paste it), run the test, and watch it go red then green. All code below was run and passes on Python 3.14.
 
-### Step 0: Project skeleton
+### Step 0: Project skeleton (uv, pytest, ruff, ty)
+
+This guide uses the current Python toolchain:
+
+| Tool | Replaces | Job |
+|---|---|---|
+| **uv** | pip, venv, pip-tools, pyenv | creates the project, manages the virtualenv and Python version, locks dependencies |
+| **ruff** | flake8, isort, black | linting and formatting, in milliseconds |
+| **ty** | mypy / pyright | type checking. It is Astral's checker and still **beta (pre-1.0)**; mypy is a fine substitute |
+| **pytest** | | tests |
+
+Install uv once (`brew install uv`, or see <https://docs.astral.sh/uv/>), then:
 
 ```bash
-mkdir allocation && cd allocation
-python3 -m venv .venv && source .venv/bin/activate
-pip install pytest
+uv init --package allocation --python 3.12
+cd allocation
+uv add --dev uv run pytest ruff ty
 mkdir -p src/allocation/domain tests/unit
-touch src/allocation/__init__.py src/allocation/domain/__init__.py
+touch src/allocation/domain/__init__.py
 ```
 
-Create `pytest.ini` so tests can `import allocation`:
+`uv init --package` creates a `src/` layout project: a `pyproject.toml`, a `.python-version`, and a stub `main()` in `src/allocation/__init__.py`. We're not building a command-line tool, so **empty that `__init__.py`** and **delete the `[project.scripts]` section** from `pyproject.toml`. `uv add --dev` records dev-only tools under `[dependency-groups]`, creates `.venv`, and installs them. The project itself is installed in editable mode, so `import allocation` just works. (Your version numbers will differ from the ones below; uv writes whatever is current.)
 
-**📄 `pytest.ini`**
+Now add the tool settings at the bottom of `pyproject.toml`. This is the file as it should look at the end of this chapter:
 
-```ini
-[pytest]
-pythonpath = src
-testpaths = tests
+**📄 `pyproject.toml`**
+
+```
+[project]
+name = "allocation"
+version = "0.1.0"
+description = "Allocation service from Architecture Patterns with Python"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+    "ty>=0.0.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ```
 
-*Why `src/` layout?* The code in `src/allocation` is the thing you ship. Tests live beside it, not inside it, and import it like any other user would.
+*Why `src/` layout?* The code in `src/allocation` is the thing you ship. Tests live beside it, not inside it, and import it like any other user would. `uv sync` rebuilds the same environment from `uv.lock` on any machine.
+
+The four commands you'll use all the time:
+
+```bash
+uv run pytest        # tests
+uv run ruff check    # lint   (add --fix to auto-fix)
+uv run ruff format   # format
+uv run ty check src  # types
+```
 
 ### Step 1: Write the first test (red)
 
@@ -132,18 +259,17 @@ def test_allocating_to_a_batch_reduces_the_available_quantity():
 ```python
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional, List, Set
 
 
 class OutOfStock(Exception):
     pass
 
 
-def allocate(line: "OrderLine", batches: List["Batch"]) -> str:
+def allocate(line: "OrderLine", batches: list["Batch"]) -> str:
     try:
         batch = next(b for b in sorted(batches) if b.can_allocate(line))
     except StopIteration:
-        raise OutOfStock(f"Out of stock for sku {line.sku}")
+        raise OutOfStock(f"Out of stock for sku {line.sku}") from None
     batch.allocate(line)
     return batch.reference
 
@@ -156,12 +282,12 @@ class OrderLine:
 
 
 class Batch:
-    def __init__(self, ref: str, sku: str, qty: int, eta: Optional[date]):
+    def __init__(self, ref: str, sku: str, qty: int, eta: date | None):
         self.reference = ref
         self.sku = sku
         self.eta = eta
         self._purchased_quantity = qty
-        self._allocations: Set[OrderLine] = set()
+        self._allocations: set[OrderLine] = set()
 
     def __repr__(self):
         return f"<Batch {self.reference}>"
@@ -209,9 +335,10 @@ Each test below is a rule from the business. Add them **one by one**, each time 
 
 ```python
 from datetime import date, timedelta
+
 import pytest
 
-from allocation.domain.model import allocate, OrderLine, Batch, OutOfStock
+from allocation.domain.model import Batch, OrderLine, OutOfStock, allocate
 
 today = date.today()
 tomorrow = today + timedelta(days=1)
@@ -321,7 +448,7 @@ Suggested order and what each drives into the model:
 ### Step 4: Run and expect
 
 ```bash
-pytest -q
+uv run pytest -q
 # ...........                                                  [100%]
 # 11 passed
 ```

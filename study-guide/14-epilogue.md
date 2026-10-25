@@ -16,13 +16,13 @@ Take the ideas to real, messy codebases. Don't rewrite everything: **strangle** 
 ```mermaid
 flowchart TB
     subgraph Entry["Entrypoints"]
-        Flask[Flask API]
+        FastAPI[FastAPI API]
         RedisC[Redis consumer]
     end
     Boot["Bootstrap / composition root"] -. wires .-> Bus
-    Flask -->|commands| Bus
+    FastAPI -->|commands| Bus
     RedisC -->|commands| Bus
-    Flask -->|queries| Views[views / read model]
+    FastAPI -->|queries| Views[views / read model]
     subgraph App["Service layer"]
         Bus{{MessageBus}} --> Handlers[Command and event handlers]
     end

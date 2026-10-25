@@ -10,7 +10,7 @@ Companion code (one branch per chapter, handy for diffing when stuck): https://g
 | 1 | `chapter_01_domain_model` | Logic buried in infrastructure → pure domain model | `OrderLine` (value object), `Batch` (entity), `allocate()`, `OutOfStock`; 8 passing unit tests |
 | 2 | `chapter_02_repository` | Model coupled to ORM → repository + inverted ORM | `orm.py` mapping, `AbstractRepository`, SQLAlchemy repo, `FakeRepository` |
 | 3 | `chapter_03_abstractions` | Hard-to-test I/O → functional core / imperative shell, fakes over mocks | The directory-sync exercise, tested edge to edge with a fake |
-| 4 | `chapter_04_service_layer` | Orchestration in Flask → service layer | `services.allocate`, Flask endpoint, e2e test |
+| 4 | `chapter_04_service_layer` | Orchestration in the web handler → service layer | `services.allocate`, FastAPI endpoint with pydantic models, `TestClient` e2e tests |
 | 5 | `chapter_05_high_gear_low_gear` | Tests coupled to the model → service-layer tests in domain language | Service tests with no `model.` imports; `add_batch`, `deallocate` services |
 | 6 | `chapter_06_uow` | Services juggle session and repo → Unit of Work | `AbstractUnitOfWork`, SQLAlchemy + fake UoW, rollback tests |
 | 7 | `chapter_07_aggregate` | No home for the cross-batch invariant, concurrency → `Product` aggregate, version number | `Product.allocate`, repo `get(sku)`, threaded concurrency test (Postgres) |
@@ -32,3 +32,7 @@ Part pages: `part1` (domain modeling and architecture, ch1-7), `part2` (event-dr
 ## The cumulative smell chain (say it aloud when crossing chapters)
 
 ch1 model is pure → ch2 storage hidden behind a repo → ch4 services orchestrate but know about sessions → ch6 UoW hides the session → ch7 aggregate defines the consistency boundary → ch8 events carry side-effects out of the model → ch9 the bus replaces the service layer → ch10 commands and events are distinguished → ch11 events leave the process → ch12 reads leave the domain model → ch13 wiring is centralised so tests stop patching.
+
+## Stack used by the study guide (differs from the book)
+
+uv, ruff, ty, pytest, FastAPI, pydantic v2, pydantic-settings, SQLAlchemy 2.x, httpx2, psycopg 3, redis-py. Web framework: FastAPI instead of Flask (ch04 onward). See `study-guide/00-setup.md`.

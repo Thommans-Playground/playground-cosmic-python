@@ -29,6 +29,43 @@ flowchart LR
     Low -. later: migrate the valuable ones .-> High
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: how service tests set up their data
+
+**The conventional way:** build domain objects directly in the tests.
+
+```python
+def test_returns_allocation():
+    batch = model.Batch("b1", "COMPLICATED-LAMP", 100, eta=None)
+    repo = FakeRepository([batch])
+    assert services.allocate("o1", "COMPLICATED-LAMP", 10, repo, FakeSession()) == "b1"
+```
+
+**Where it breaks**
+- Every test is welded to `Batch`'s constructor. 🧪 Even our tiny ch04 service suite has 3 direct `model.Batch(` calls; a real suite has hundreds. Add a required argument to `Batch` and they all go red, though no behaviour changed.
+- The model becomes expensive to refactor, which is the opposite of why we separated it.
+
+**The better way** (Steps 1-2): set up through the service's own API: `services.add_batch(...)`.
+
+**Why it's right:** 🧪 the ch05 service suite has **0** direct domain constructions. Change `Batch` and you fix one line inside `add_batch`.
+**What it costs:** setup now depends on `add_batch` working (if it breaks, many tests fail together, though the cause is one obvious place), and it takes longer to read as "pure unit" tests.
+
+### Addition 2: which level do most tests live at?
+
+**The conventional way:** either test only through HTTP ("test the real thing") or only through the domain model.
+
+**Where it breaks**
+- *Only HTTP:* every test needs the app and a database; the suite slows as it grows; a failing test says `400 != 201` and you start digging. The number of combinations (rules x endpoints x states) explodes. 📖
+- *Only domain:* the tests double as a frozen API for the model, so refactoring it breaks them; and orchestration (SKU validation, committing, event wiring) isn't covered at all. That is the low-gear trap.
+
+**The better way** (Step 6): a **pyramid**: many service-layer tests in the language of use cases, a few e2e tests as a safety net, and domain tests mostly as design scaffolding you may delete later.
+
+**Why it's right:** service tests are fast, cover behaviour users care about, and survive model refactors.
+**What it costs:** fakes can drift from the real adapters (hence the few integration/e2e tests), and you must resist adding domain tests for everything just because they're easy to write.
+
 ## 🛬 1,000 ft: design decisions
 - Service tests currently use domain objects (`model.Batch`, `model.OrderLine`). That couples them to the model. Fix: services expose `add_batch(ref, sku, qty, eta, repo, session)` so tests only use primitives.
 - Add `deallocate` and `reallocate` use cases to see the pattern at speed.
@@ -37,7 +74,7 @@ flowchart LR
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch04 project. Changes: add `add_batch` and `deallocate` services and an `/add_batch` endpoint; **rewrite the service tests so they never import `model`**. All code below was run and passes (28 tests).
+> Starts from your finished ch04 project. Changes: add `add_batch` and `deallocate` services and an `/add_batch` endpoint; **rewrite the service tests so they never import `model`**. All code below was run and passes (31 tests).
 
 ### The idea in one picture
 
@@ -187,7 +224,6 @@ def test_prefers_warehouse_batches_to_shipments():
 
 ```python
 from datetime import date
-from typing import Optional
 
 from allocation.adapters import repository
 from allocation.domain import model
@@ -205,7 +241,7 @@ def add_batch(
     ref: str,
     sku: str,
     qty: int,
-    eta: Optional[date],
+    eta: date | None,
     repo: repository.AbstractRepository,
     session,
 ):
@@ -213,9 +249,7 @@ def add_batch(
     session.commit()
 
 
-def allocate(
-    orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session
-) -> str:
+def allocate(orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session) -> str:
     line = model.OrderLine(orderid, sku, qty)
     batches = repo.list()
     if not is_valid_sku(line.sku, batches):
@@ -225,9 +259,7 @@ def allocate(
     return batchref
 
 
-def deallocate(
-    orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session
-):
+def deallocate(orderid: str, sku: str, qty: int, repo: repository.AbstractRepository, session):
     line = model.OrderLine(orderid, sku, qty)
     batches = repo.list()
     if not is_valid_sku(line.sku, batches):
@@ -243,14 +275,19 @@ def deallocate(
 
 **Why:** the e2e tests now describe the system only through its public API, so they survive a rewrite of the model, ORM or database.
 
-**📄 `src/allocation/entrypoints/flask_app.py`**
+Pydantic does the date handling here: `AddBatchRequest.eta` is typed `date | None`, so the ISO string `"2030-01-01"` arrives as a real `date`, and `"next tuesday"` is rejected with a 422. There's no hand-written parsing in the entrypoint.
+
+**📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import date
+from typing import Annotated
 
-from flask import Flask, request
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from allocation import config
 from allocation.adapters import orm, repository
@@ -258,48 +295,54 @@ from allocation.domain import model
 from allocation.service_layer import services
 
 
-def create_app(session_factory=None):
+class AddBatchRequest(BaseModel):
+    ref: str
+    sku: str
+    qty: int = Field(gt=0)
+    eta: date | None = None  # pydantic parses "2030-01-01" for us
+
+
+class AllocateRequest(BaseModel):
+    orderid: str
+    sku: str
+    qty: int = Field(gt=0)
+
+
+class AllocateResponse(BaseModel):
+    batchref: str
+
+
+def create_app(session_factory=None) -> FastAPI:
     if session_factory is None:
-        engine = create_engine(config.get_db_uri())
+        engine = create_engine(config.get_settings().db_uri)
         orm.metadata.create_all(engine)
         orm.start_mappers()
         session_factory = sessionmaker(bind=engine)
 
-    app = Flask(__name__)
+    app = FastAPI(title="Allocation service")
 
-    @app.route("/add_batch", methods=["POST"])
-    def add_batch_endpoint():
+    def get_session() -> Iterator[Session]:
         session = session_factory()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    DbSession = Annotated[Session, Depends(get_session)]
+
+    @app.post("/add_batch", status_code=201)
+    def add_batch_endpoint(body: AddBatchRequest, session: DbSession) -> None:
         repo = repository.SqlAlchemyRepository(session)
-        eta = request.json["eta"]
-        if eta is not None:
-            eta = datetime.fromisoformat(eta).date()
-        services.add_batch(
-            request.json["ref"],
-            request.json["sku"],
-            request.json["qty"],
-            eta,
-            repo,
-            session,
-        )
-        return "OK", 201
+        services.add_batch(body.ref, body.sku, body.qty, body.eta, repo, session)
 
-    @app.route("/allocate", methods=["POST"])
-    def allocate_endpoint():
-        session = session_factory()
+    @app.post("/allocate", status_code=201)
+    def allocate_endpoint(body: AllocateRequest, session: DbSession) -> AllocateResponse:
         repo = repository.SqlAlchemyRepository(session)
         try:
-            batchref = services.allocate(
-                request.json["orderid"],
-                request.json["sku"],
-                request.json["qty"],
-                repo,
-                session,
-            )
+            batchref = services.allocate(body.orderid, body.sku, body.qty, repo, session)
         except (model.OutOfStock, services.InvalidSku) as e:
-            return {"message": str(e)}, 400
-
-        return {"batchref": batchref}, 201
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return AllocateResponse(batchref=batchref)
 
     return app
 ```
@@ -308,9 +351,11 @@ def create_app(session_factory=None):
 
 ```python
 import uuid
-import pytest
 
-from allocation.entrypoints.flask_app import create_app
+import pytest
+from fastapi.testclient import TestClient
+
+from allocation.entrypoints.fastapi_app import create_app
 
 
 def random_suffix():
@@ -331,7 +376,7 @@ def random_orderid(name=""):
 
 @pytest.fixture
 def client(session_factory):
-    return create_app(session_factory).test_client()
+    return TestClient(create_app(session_factory))
 
 
 def post_to_add_batch(client, ref, sku, qty, eta):
@@ -352,7 +397,7 @@ def test_happy_path_returns_201_and_allocated_batch(client):
     r = client.post("/allocate", json=data)
 
     assert r.status_code == 201
-    assert r.json["batchref"] == earlybatch
+    assert r.json()["batchref"] == earlybatch
 
 
 def test_unhappy_path_returns_400_and_error_message(client):
@@ -362,19 +407,34 @@ def test_unhappy_path_returns_400_and_error_message(client):
     r = client.post("/allocate", json=data)
 
     assert r.status_code == 400
-    assert r.json["message"] == f"Invalid sku {unknown_sku}"
+    assert r.json()["detail"] == f"Invalid sku {unknown_sku}"
+
+
+@pytest.mark.parametrize("qty", [0, -3])
+def test_non_positive_quantity_is_rejected_by_validation(client, qty):
+    r = client.post("/allocate", json={"orderid": "o1", "sku": "ANY-SKU", "qty": qty})
+
+    assert r.status_code == 422  # rejected by pydantic before any of our code ran
+
+
+def test_malformed_eta_is_rejected_by_validation(client):
+    r = client.post(
+        "/add_batch", json={"ref": "b1", "sku": "ANY-SKU", "qty": 10, "eta": "next tuesday"}
+    )
+
+    assert r.status_code == 422
 ```
 
 ```bash
-pytest -q
-# 28 passed
+uv run pytest -q
+# 31 passed
 ```
 
 ### Step 6: Take stock of your pyramid
 
 ```bash
-pytest tests/unit -q --co | tail -1      # count unit tests (domain + service)
-pytest tests/e2e  -q --co | tail -1      # count e2e tests
+uv run pytest tests/unit -q --co | tail -1      # count unit tests (domain + service)
+uv run pytest tests/e2e  -q --co | tail -1      # count e2e tests
 ```
 
 Roughly: many fast domain/service tests, a handful of slow e2e tests. Mark in your notes which `test_batches.py` tests you would **delete** in a mature codebase because a service test now covers the same behaviour. Keep them for now: low-gear tests are scaffolding for design, and the book suggests deleting only the ones that no longer teach you anything.

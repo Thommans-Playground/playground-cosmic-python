@@ -1,7 +1,7 @@
 # Chapter 8: Events and the Message Bus
 
 ## ✈️ 30,000 ft
-New requirement: "when a SKU is out of stock, email the purchasing team." Bolting that into `allocate` (or the service, or Flask) tangles unrelated concerns. Instead, the model **records an event** and a **message bus** routes it to handlers.
+New requirement: "when a SKU is out of stock, email the purchasing team." Bolting that into `allocate` (or the service, or the web handler) tangles unrelated concerns. Instead, the model **records an event** and a **message bus** routes it to handlers.
 
 ## 🛫 10,000 ft
 - **Single Responsibility Principle**: "allocate" should not know about email.
@@ -19,7 +19,7 @@ New requirement: "when a SKU is out of stock, email the purchasing team." Boltin
 
 ```mermaid
 sequenceDiagram
-    participant API as Flask
+    participant API as FastAPI
     participant H as Service
     participant P as Product (model)
     participant U as UoW
@@ -43,6 +43,65 @@ flowchart LR
     Bus --> H2[Other handlers]
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: "email purchasing when we run out of stock"
+
+**The conventional way:** just send it where the failure is detected.
+
+```python
+def allocate(orderid, sku, qty, uow):
+    with uow:
+        product = uow.products.get(sku=sku)
+        batchref = product.allocate(OrderLine(orderid, sku, qty))
+        if batchref is None:
+            email.send("stock@made.com", f"Out of stock for {sku}")   # I/O inline
+        uow.commit()
+    return batchref
+```
+
+**Where it breaks**
+- Ordering has no good answer. Send *before* the commit and you can email about a transaction that later rolls back. Send *after* and a failing mail server turns a finished piece of work into an exception. 🧪 (the same effect as ch06's demo: the work was persisted, the caller saw an error, and a retry duplicates it.)
+- Every test of `allocate` now needs to stub out email.
+- The next request ("also post to Slack, also update the dashboard") edits the same function. It grows into a god-function that knows about every consumer of its results.
+
+**The better way** (Steps 3-5): the model *records a fact* (`OutOfStock(sku)`) and a **handler** reacts to it, wired through a small message bus.
+
+**Why it's right:** `allocate` stays about allocation. Adding "also post to Slack" is appending one function to a list; nothing existing changes.
+**What it costs:** the control flow is now indirect. Reading `allocate` you can't see that an email goes out; you have to look up `OutOfStock` in the handler table. Debugging means following events.
+
+### Addition 2: where does the model hand off the side-effect?
+
+**The conventional way:** the domain model does the I/O itself.
+
+```python
+class Product:
+    def allocate(self, line):
+        ...
+        except StopIteration:
+            email.send("stock@made.com", f"Out of stock for {line.sku}")
+```
+
+**Where it breaks:** the model imports infrastructure, so every domain test needs a mail stub, and a script that merely *uses* the model (a simulation, a data fix) can send real emails by accident. It also undoes the whole of ch01-ch02: the pure model is gone.
+
+**The better way** (Step 3): `Product` appends an event to `self.events`; it never learns who listens.
+
+**Why it's right:** the domain stays free of I/O, and recording an event is a plain assertion in a unit test (`product.events[-1] == OutOfStock(...)`).
+**What it costs:** one more concept (events) and a small ORM gotcha: SQLAlchemy skips `__init__` when loading, so you need the `load` listener from Step 3.
+
+### Addition 3: who publishes the events?
+
+**The conventional way:** each service remembers to call `messagebus.handle(...)` after committing.
+
+**Where it breaks:** forgetting it in one of the services gives you a use case that silently never notifies. No test fails; the email just never arrives.
+
+**The better way** (Step 5): the repository records every product it hands out (`seen`), and the Unit of Work publishes their events right after a successful commit, for every use case.
+
+**Why it's right:** it can't be forgotten, because it isn't the service's job.
+**What it costs:** the UoW now depends on the message bus. Ch09 reverses that so the bus pulls events from the UoW instead.
+
 ## 🛬 1,000 ft: design decisions
 - `events.py`: `Event` base + `OutOfStock`.
 - `Product.allocate` now appends `events.OutOfStock(sku)` and returns `None` instead of raising.
@@ -53,13 +112,13 @@ flowchart LR
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch07 project. New requirement: **email the purchasing team when a SKU is out of stock.** New files: `domain/events.py`, `adapters/email.py`, `service_layer/handlers.py`, `service_layer/messagebus.py`. 34 tests pass, 1 skipped (the Postgres one).
+> Starts from your finished ch07 project. New requirement: **email the purchasing team when a SKU is out of stock.** New files: `domain/events.py`, `adapters/email.py`, `service_layer/handlers.py`, `service_layer/messagebus.py`. 37 tests pass, 1 skipped (the Postgres one).
 
 ### Why not just call `email.send()` where the failure happens?
 
 | Place | Problem |
 |---|---|
-| In the Flask handler | The web layer now makes business decisions. |
+| In the FastAPI handler | The web layer now makes business decisions. |
 | In `Product.allocate` | The domain model does I/O; it can't be tested without mocking email. |
 | In the service | Allocation logic gets entangled with notification. Next requirement ("also text the warehouse") makes it worse. |
 
@@ -110,13 +169,13 @@ def test_records_out_of_stock_event_if_cannot_allocate():
 from allocation.domain import events          # new import at the top
 
 class Product:
-    def __init__(self, sku: str, batches: List[Batch], version_number: int = 0):
+    def __init__(self, sku: str, batches: list[Batch], version_number: int = 0):
         self.sku = sku
         self.batches = batches
         self.version_number = version_number
-        self.events = []  # type: List[events.Event]      # new
+        self.events: list[events.Event] = []      # new
 
-    def allocate(self, line: OrderLine) -> Optional[str]:
+    def allocate(self, line: OrderLine) -> str | None:
         try:
             batch = next(b for b in sorted(self.batches) if b.can_allocate(line))
             batch.allocate(line)
@@ -169,7 +228,7 @@ def send_out_of_stock_notification(event: events.OutOfStock):
 **📄 `src/allocation/service_layer/messagebus.py`**
 
 ```python
-from typing import List, Dict, Callable, Type
+from collections.abc import Callable
 
 from allocation.domain import events
 from allocation.service_layer import handlers
@@ -180,9 +239,9 @@ def handle(event: events.Event):
         handler(event)
 
 
-HANDLERS = {
+HANDLERS: dict[type[events.Event], list[Callable]] = {
     events.OutOfStock: [handlers.send_out_of_stock_notification],
-}  # type: Dict[Type[events.Event], List[Callable]]
+}
 ```
 
 ### Step 5: Who publishes the events? The Unit of Work.
@@ -198,7 +257,6 @@ You *could* have each service call `messagebus.handle(...)` after committing, bu
 
 ```python
 import abc
-from typing import Set
 
 from allocation.domain import model
 
@@ -206,7 +264,7 @@ from allocation.domain import model
 class AbstractRepository(abc.ABC):
     def __init__(self):
         # every aggregate that passes through the repo; the UoW reads its events
-        self.seen = set()  # type: Set[model.Product]
+        self.seen: set[model.Product] = set()
 
     def add(self, product: model.Product):
         self._add(product)
@@ -244,6 +302,7 @@ class SqlAlchemyRepository(AbstractRepository):
 ```python
 # pylint: disable=attribute-defined-outside-init
 from __future__ import annotations
+
 import abc
 
 from allocation.adapters import repository
@@ -301,18 +360,75 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
 
 ### Step 6: Tell the API about "out of stock"
 
-`allocate` now returns `None` instead of raising, so the Flask endpoint must translate that to the same 400 response as before. Replace the `except` clause and add the `None` check:
+`allocate` now returns `None` instead of raising, so the endpoint must translate that into the same 400 as before. Change the service's return type to `str | None`, drop the now-unused `OutOfStock` from the `except`, and add the `None` check:
 
 ```python
         except services.InvalidSku as e:
-            return {"message": str(e)}, 400
-
+            raise HTTPException(status_code=400, detail=str(e)) from e
         if batchref is None:
-            return {"message": f"Out of stock for sku {request.json['sku']}"}, 400
-        return {"batchref": batchref}, 201
+            raise HTTPException(status_code=400, detail=f"Out of stock for sku {body.sku}")
+        return AllocateResponse(batchref=batchref)
 ```
 
-(Change the service's return type to `Optional[str]`, remove the now-unused `model` import from `flask_app.py`.) Add an e2e test `test_out_of_stock_returns_400`.
+Full file after this change (it also uses `orm.make_session_factory` from ch07):
+
+**📄 `src/allocation/entrypoints/fastapi_app.py`**
+
+```python
+from datetime import date
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from allocation import config
+from allocation.adapters import orm
+from allocation.service_layer import services, unit_of_work
+
+
+class AddBatchRequest(BaseModel):
+    ref: str
+    sku: str
+    qty: int = Field(gt=0)
+    eta: date | None = None  # pydantic parses "2030-01-01" for us
+
+
+class AllocateRequest(BaseModel):
+    orderid: str
+    sku: str
+    qty: int = Field(gt=0)
+
+
+class AllocateResponse(BaseModel):
+    batchref: str
+
+
+def create_app(session_factory=None) -> FastAPI:
+    if session_factory is None:
+        orm.start_mappers()
+        session_factory = orm.make_session_factory(config.get_settings().db_uri)
+
+    app = FastAPI(title="Allocation service")
+
+    @app.post("/add_batch", status_code=201)
+    def add_batch_endpoint(body: AddBatchRequest) -> None:
+        uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+        services.add_batch(body.ref, body.sku, body.qty, body.eta, uow)
+
+    @app.post("/allocate", status_code=201)
+    def allocate_endpoint(body: AllocateRequest) -> AllocateResponse:
+        uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+        try:
+            batchref = services.allocate(body.orderid, body.sku, body.qty, uow)
+        except services.InvalidSku as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if batchref is None:
+            raise HTTPException(status_code=400, detail=f"Out of stock for sku {body.sku}")
+        return AllocateResponse(batchref=batchref)
+
+    return app
+```
+
+Add an e2e test `test_out_of_stock_returns_400`.
 
 ### Step 7: Prove the email is sent
 
@@ -357,8 +473,8 @@ def test_sends_email_on_out_of_stock_error():
 ```
 
 ```bash
-pytest -q
-# 34 passed, 1 skipped
+uv run pytest -q
+# 37 passed, 1 skipped
 ```
 
 ### Trade-off to write in your notes

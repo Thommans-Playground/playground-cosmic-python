@@ -52,6 +52,57 @@ sequenceDiagram
     end
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: where the transaction starts and ends
+
+**The conventional way:** commit wherever it's convenient, sometimes more than once.
+
+```python
+def allocate(orderid, sku, qty, repo, session):
+    ...
+    batchref = model.allocate(line, batches)
+    session.commit()                      # commit #1
+    email.send("stock@made.com", "...")   # step 2
+    audit_log.write(orderid, batchref)    # step 3
+    session.commit()                      # commit #2
+    return batchref
+```
+
+**Where it breaks**
+- 🧪 I made step 2 fail after commit #1. The request failed (the client sees a 500) and **the allocation was persisted anyway**. The client retries, and now you have a half-done operation plus a duplicate attempt.
+- There is no single place that defines "this is one atomic operation", so every new step re-opens the question.
+
+**The better way** (Step 1): a **Unit of Work**, a context manager where one `with` block is one transaction.
+
+**Why it's right:** the boundary is explicit and in one spot, and *leaving the block without calling `commit()` rolls everything back*: safe by default.
+**What it costs:** another abstraction to learn and a `uow` argument everywhere, and for a request that does one write it is more machinery than the job needs.
+
+### Addition 2: cleaning up after a failure
+
+**The conventional way:** hand-written `try / except / rollback` in each service, or none at all.
+
+```python
+def allocate(...):
+    try:
+        ...
+        session.commit()
+    except Exception:
+        session.rollback()    # easy to forget in one of the twenty services
+        raise
+```
+
+**Where it breaks**
+- 🧪 After a failed flush the session is unusable until you roll back: the very next query raised `PendingRollbackError`. If a session is shared (a thread-scoped session in a worker, say) one failed request poisons the next ones.
+- Forgetting the `rollback()` in one of many services creates a bug that only shows up after a different request has failed.
+
+**The better way** (Step 1): `__exit__` always calls `rollback()`, and each unit of work opens its own fresh session in `__enter__` and closes it in `__exit__`.
+
+**Why it's right:** cleanup is structural, so nobody can forget it.
+**What it costs:** a new session (and connection checkout) per unit of work, which is fine for request-sized work but worth knowing about at high throughput.
+
 ## 🛬 1,000 ft: design decisions
 - `AbstractUnitOfWork` implements `__enter__`/`__exit__`; `__exit__` calls `self.rollback()`.
 - `commit()` and `rollback()` are abstract; `batches` is an attribute set in `__enter__`.
@@ -64,11 +115,11 @@ sequenceDiagram
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch05 project. New: `service_layer/unit_of_work.py`. Changed: services, Flask app, service tests. Added: UoW integration tests. All code below was run and passes (30 tests).
+> Starts from your finished ch05 project. New: `service_layer/unit_of_work.py`. Changed: services, FastAPI app, service tests. Added: UoW integration tests. All code below was run and passes (33 tests).
 
 ### The smell you're fixing
 
-Every service takes `(…, repo, session)` and has to remember to call `session.commit()`. The Flask handler creates the session and repo. Two things know about the transaction. The Unit of Work makes *one* object own it.
+Every service takes `(…, repo, session)` and has to remember to call `session.commit()`. The FastAPI handler creates the session and repo. Two things know about the transaction. The Unit of Work makes *one* object own it.
 
 ### Step 1: Write the abstraction
 
@@ -85,6 +136,7 @@ Every service takes `(…, repo, session)` and has to remember to call `session.
 ```python
 # pylint: disable=attribute-defined-outside-init
 from __future__ import annotations
+
 import abc
 
 from allocation.adapters import repository
@@ -231,8 +283,8 @@ def test_prefers_warehouse_batches_to_shipments():
 
 ```python
 from __future__ import annotations
+
 from datetime import date
-from typing import Optional
 
 from allocation.domain import model
 from allocation.service_layer import unit_of_work
@@ -250,7 +302,7 @@ def add_batch(
     ref: str,
     sku: str,
     qty: int,
-    eta: Optional[date],
+    eta: date | None,
     uow: unit_of_work.AbstractUnitOfWork,
 ):
     with uow:
@@ -258,9 +310,7 @@ def add_batch(
         uow.commit()
 
 
-def allocate(
-    orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork
-) -> str:
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
     line = model.OrderLine(orderid, sku, qty)
     with uow:
         batches = uow.batches.list()
@@ -271,9 +321,7 @@ def allocate(
     return batchref
 
 
-def deallocate(
-    orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork
-):
+def deallocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork):
     line = model.OrderLine(orderid, sku, qty)
     with uow:
         batches = uow.batches.list()
@@ -284,16 +332,17 @@ def deallocate(
         uow.commit()
 ```
 
-### Step 4: Change the Flask app
+### Step 4: Change the FastAPI app
 
-**Do:** the handlers now build a `SqlAlchemyUnitOfWork(session_factory)` and hand it over. No session, no repo in the entrypoint.
+**Do:** the handlers now build a `SqlAlchemyUnitOfWork(session_factory)` and hand it over. No session, no repo in the entrypoint, and ch04's `get_session` yield-dependency is gone: the UoW opens and closes its own session.
 
-**📄 `src/allocation/entrypoints/flask_app.py`**
+**📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
-from datetime import datetime
+from datetime import date
 
-from flask import Flask, request
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -303,42 +352,45 @@ from allocation.domain import model
 from allocation.service_layer import services, unit_of_work
 
 
-def create_app(session_factory=None):
+class AddBatchRequest(BaseModel):
+    ref: str
+    sku: str
+    qty: int = Field(gt=0)
+    eta: date | None = None  # pydantic parses "2030-01-01" for us
+
+
+class AllocateRequest(BaseModel):
+    orderid: str
+    sku: str
+    qty: int = Field(gt=0)
+
+
+class AllocateResponse(BaseModel):
+    batchref: str
+
+
+def create_app(session_factory=None) -> FastAPI:
     if session_factory is None:
-        engine = create_engine(config.get_db_uri())
+        engine = create_engine(config.get_settings().db_uri)
         orm.metadata.create_all(engine)
         orm.start_mappers()
         session_factory = sessionmaker(bind=engine)
 
-    app = Flask(__name__)
+    app = FastAPI(title="Allocation service")
 
-    @app.route("/add_batch", methods=["POST"])
-    def add_batch_endpoint():
-        eta = request.json["eta"]
-        if eta is not None:
-            eta = datetime.fromisoformat(eta).date()
-        services.add_batch(
-            request.json["ref"],
-            request.json["sku"],
-            request.json["qty"],
-            eta,
-            unit_of_work.SqlAlchemyUnitOfWork(session_factory),
-        )
-        return "OK", 201
+    @app.post("/add_batch", status_code=201)
+    def add_batch_endpoint(body: AddBatchRequest) -> None:
+        uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+        services.add_batch(body.ref, body.sku, body.qty, body.eta, uow)
 
-    @app.route("/allocate", methods=["POST"])
-    def allocate_endpoint():
+    @app.post("/allocate", status_code=201)
+    def allocate_endpoint(body: AllocateRequest) -> AllocateResponse:
+        uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
         try:
-            batchref = services.allocate(
-                request.json["orderid"],
-                request.json["sku"],
-                request.json["qty"],
-                unit_of_work.SqlAlchemyUnitOfWork(session_factory),
-            )
+            batchref = services.allocate(body.orderid, body.sku, body.qty, uow)
         except (model.OutOfStock, services.InvalidSku) as e:
-            return {"message": str(e)}, 400
-
-        return {"batchref": batchref}, 201
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return AllocateResponse(batchref=batchref)
 
     return app
 ```
@@ -418,10 +470,9 @@ def test_rolls_back_on_error(session_factory):
         pass
 
     uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
-    with pytest.raises(MyException):
-        with uow:
-            insert_batch(uow.session, "batch1", "LARGE-FORK", 100, None)
-            raise MyException()
+    with pytest.raises(MyException), uow:
+        insert_batch(uow.session, "batch1", "LARGE-FORK", 100, None)
+        raise MyException()
 
     new_session = session_factory()
     rows = list(new_session.execute(text('SELECT * FROM "batches"')))
@@ -433,8 +484,8 @@ def test_rolls_back_on_error(session_factory):
 ### Step 6: Run everything
 
 ```bash
-pytest -q
-# 30 passed
+uv run pytest -q
+# 33 passed
 ```
 
 ### Stretch

@@ -37,9 +37,47 @@ flowchart LR
     O5 -. fastest, most moving parts .- O5
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: answering "where is my order allocated?"
+
+**The conventional way:** read through the domain model.
+
+```python
+found = []
+for product in repo.list():                       # every product
+    for batch in product.batches:                 # every batch
+        for line in batch._allocations:           # every allocation (and reaching into a private attribute)
+            if line.orderid == orderid:
+                found.append((line.sku, batch.reference))
+```
+
+**Where it breaks**
+- 🧪 I ran this against 20 SKUs with 3 batches each: **81 SQL statements** to answer one question (1 for products + 20 for their batches + 60 for the allocations of each batch). That is the classic N+1 pattern; it grows with your data.
+- It loads whole aggregates, with all their state, to read two strings.
+- Reporting needs pull the domain model toward reads (public accessors for private state), distorting the part that exists to protect writes.
+
+**The better way** (Steps 2-3): a **read model**, a small table shaped exactly like the answer (`allocations_view`), kept current by event handlers, queried with a single plain SQL statement.
+
+**Why it's right:** one statement, no object hydration, no pressure on the domain model. Reads can be optimised or moved (to Redis, say) without touching the write side.
+**What it costs:** data now lives in two shapes. The view is **eventually consistent**, and (from ch10) if a handler that updates it fails, the error is swallowed and the view silently diverges. You also write and test the sync handlers.
+
+### Addition 2: making the command return the answer
+
+**The conventional way:** `POST /allocate` computes the allocation and returns the result.
+
+**Where it breaks:** a "write" endpoint doubles as a query, so the command and the read format are glued together. Any new representation clients want forces you to change how allocation is executed.
+
+**The better way** (Step 5): the command returns **202 Accepted**; clients ask for the result with `GET /allocations/<orderid>`.
+
+**Why it's right:** each side can evolve alone, and the read can be cached or scaled independently.
+**What it costs:** an extra round trip for clients, and "read your own write" is no longer guaranteed if the read model lags. You also changed behaviour: out-of-stock is no longer a 400 on the POST (it's an accepted request that produced nothing), which you must decide is acceptable for your users.
+
 ## 🛬 1,000 ft: design decisions
 - `views.allocations(orderid, uow)` runs raw SQL and returns a list of dicts.
-- Flask `GET /allocations/<orderid>` calls the view; 404 if empty.
+- FastAPI `GET /allocations/<orderid>` calls the view; 404 if empty.
 - The `allocation` command no longer returns anything; the client does `POST /allocate` (202 Accepted) and later `GET`.
 - Denormalised table `allocations_view(orderid, sku, batchref)` updated via event handlers:
   - `Allocated` → insert
@@ -49,7 +87,7 @@ flowchart LR
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch11 project. New requirement: **"show me where my order was allocated."** 43 tests pass, 2 skipped (they need Postgres / the full Redis stack).
+> Starts from your finished ch11 project. New requirement: **"show me where my order was allocated."** 50 tests pass, 2 skipped (they need Postgres / the full Redis stack).
 
 ### The problem
 
@@ -102,17 +140,17 @@ allocations_view = Table(
 **📄 `src/allocation/views.py`**
 
 ```python
-from allocation.service_layer import unit_of_work
 from sqlalchemy import text
 
+from allocation.service_layer import unit_of_work
 
-def allocations(orderid: str, uow: unit_of_work.SqlAlchemyUnitOfWork):
+
+def allocations(orderid: str, uow: unit_of_work.AbstractUnitOfWork):
     """The query side: plain SQL against the read model, no domain objects."""
     with uow:
         results = uow.session.execute(
             text(
-                "SELECT sku, batchref FROM allocations_view"
-                " WHERE orderid = :orderid ORDER BY sku"
+                "SELECT sku, batchref FROM allocations_view WHERE orderid = :orderid ORDER BY sku"
             ),
             dict(orderid=orderid),
         )
@@ -164,18 +202,38 @@ EVENT_HANDLERS = {
 
 **Trace what happens when `ChangeBatchQuantity` shrinks a batch**: `Deallocated` → (1) delete from view, (2) `reallocate` → `Allocate` command → `Allocated` event → insert into view + publish to Redis. Draw that on paper before moving on.
 
-### Step 5: Flask: commands return "accepted", reads go through the view
+### Step 4b: Declare `session` on the abstract Unit of Work
+
+The new handlers and `views.py` use `uow.session`, but the abstract class never declared it. The type checker (`uv run ty check src`) is what caught this; at runtime it only worked because the real UoW happens to have one. Declare it, and widen `views.allocations` to take `AbstractUnitOfWork`:
+
+```python
+# unit_of_work.py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+
+class AbstractUnitOfWork(abc.ABC):
+    products: repository.AbstractRepository
+    session: Session  # the read side runs plain SQL through it
+```
+
+(That's a small leak, an abstract UoW promising a SQLAlchemy session. The book accepts it for the read side; ch13's stretch is a place to think about doing better.)
+
+### Step 5: FastAPI: commands return "accepted", reads go through the view
 
 **Do:** `POST /allocate` now returns **202 Accepted** with no body; the client calls `GET /allocations/<orderid>`. (Behaviour change from ch08–11: out-of-stock is no longer a 400 on the POST; it's an accepted request that produced no allocation, plus an email via the event. In a real product you'd decide whether that's acceptable.)
 
-**📄 `src/allocation/entrypoints/flask_app.py`**
+What's new in the entrypoint: `status_code=202` on the POST, a `GET /allocations/{orderid}` whose return type `list[AllocationOut]` is a pydantic model (FastAPI validates and documents the response from it), and a 404 raised as `HTTPException`. Each request builds its own `new_uow()`.
+
+**📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
-from datetime import datetime
+from datetime import date
 
-from flask import Flask, jsonify, request
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from allocation import config, views
 from allocation.adapters import orm
@@ -183,48 +241,56 @@ from allocation.domain import commands
 from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
-def create_app(session_factory=None):
+class AddBatchRequest(BaseModel):
+    ref: str
+    sku: str
+    qty: int = Field(gt=0)
+    eta: date | None = None  # pydantic parses "2030-01-01" for us
+
+
+class AllocateRequest(BaseModel):
+    orderid: str
+    sku: str
+    qty: int = Field(gt=0)
+
+
+class AllocateResponse(BaseModel):
+    batchref: str
+
+
+class AllocationOut(BaseModel):
+    sku: str
+    batchref: str
+
+
+def create_app(session_factory=None) -> FastAPI:
     if session_factory is None:
-        uri = config.get_db_uri()
-        kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
-        engine = create_engine(uri, **kwargs)
-        orm.metadata.create_all(engine)
         orm.start_mappers()
-        session_factory = sessionmaker(bind=engine)
+        session_factory = orm.make_session_factory(config.get_settings().db_uri)
 
-    app = Flask(__name__)
+    app = FastAPI(title="Allocation service")
 
-    @app.route("/add_batch", methods=["POST"])
-    def add_batch():
-        eta = request.json["eta"]
-        if eta is not None:
-            eta = datetime.fromisoformat(eta).date()
-        cmd = commands.CreateBatch(
-            request.json["ref"], request.json["sku"], request.json["qty"], eta
-        )
-        messagebus.handle(cmd, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
-        return "OK", 201
+    def new_uow():
+        # one UoW per request: sessions are never shared between threads
+        return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
-    @app.route("/allocate", methods=["POST"])
-    def allocate_endpoint():
+    @app.post("/add_batch", status_code=201)
+    def add_batch_endpoint(body: AddBatchRequest) -> None:
+        messagebus.handle(commands.CreateBatch(body.ref, body.sku, body.qty, body.eta), new_uow())
+
+    @app.post("/allocate", status_code=202)
+    def allocate_endpoint(body: AllocateRequest) -> None:
         try:
-            cmd = commands.Allocate(
-                request.json["orderid"], request.json["sku"], request.json["qty"]
-            )
-            messagebus.handle(cmd, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
+            messagebus.handle(commands.Allocate(body.orderid, body.sku, body.qty), new_uow())
         except handlers.InvalidSku as e:
-            return {"message": str(e)}, 400
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
-        return "OK", 202  # accepted: the result is read back via GET /allocations
-
-    @app.route("/allocations/<orderid>", methods=["GET"])
-    def allocations_view_endpoint(orderid):
-        result = views.allocations(
-            orderid, unit_of_work.SqlAlchemyUnitOfWork(session_factory)
-        )
+    @app.get("/allocations/{orderid}")
+    def allocations_endpoint(orderid: str) -> list[AllocationOut]:
+        result = views.allocations(orderid, new_uow())
         if not result:
-            return "not found", 404
-        return jsonify(result), 200
+            raise HTTPException(status_code=404, detail="not found")
+        return result
 
     return app
 ```
@@ -298,7 +364,7 @@ def test_deallocation_updates_the_view(session_factory):
 
     r = client.get(f"/allocations/{data['orderid']}")
     assert r.status_code == 200
-    assert r.json == [{"sku": sku, "batchref": earlybatch}]
+    assert r.json() == [{"sku": sku, "batchref": earlybatch}]
 
 
 def test_out_of_stock_is_accepted_but_nothing_is_allocated(client):
@@ -312,8 +378,8 @@ def test_out_of_stock_is_accepted_but_nothing_is_allocated(client):
 ```
 
 ```bash
-pytest -q
-# 43 passed, 2 skipped
+uv run pytest -q
+# 50 passed, 2 skipped
 ```
 
 ### What this costs you

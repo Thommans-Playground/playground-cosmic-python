@@ -43,6 +43,61 @@ flowchart LR
     end
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: the sync logic itself
+
+**The conventional way:** decisions and I/O in one loop, tested with `mock.patch`.
+
+```python
+def sync(source, dest):
+    for folder, _, files in os.walk(source):
+        for f in files:
+            src, dst = Path(folder) / f, Path(dest) / f
+            if not dst.exists():
+                shutil.copyfile(src, dst)
+            elif hash_file(src) != hash_file(dst):
+                shutil.copyfile(src, dst)
+    # ...and the rename and delete cases are tangled in below
+
+@mock.patch("shutil.copyfile")
+@mock.patch("os.walk")
+def test_copies_new_file(walk, copyfile): ...
+```
+
+**Where it breaks**
+- The mock tests assert on *which library call was made*. Swap `shutil.move` for `os.rename`: identical behaviour, red tests.
+- The interesting logic (spotting a rename by hash) can only be exercised by arranging fake directory walks and file contents, so people skip it or test it with real temp folders: slow, and failures are hard to read.
+- The logic can't be reused without the I/O.
+
+**The better way** (Steps 1-4): a pure function `determine_actions(src_hashes, dst_hashes, ...)` returning a list of actions (the **functional core**), wrapped by a thin shell that reads the disk and executes the actions.
+
+**Why it's right:** the decisions become "dict in, list out"; the three rules each take a three-line test with no disk.
+**What it costs:** more moving parts, and dependency passing has its own traps: 🧪 our first draft of `sync()` used `filesystem = filesystem or FileSystem()`, and an *empty* fake list is falsy, so the real filesystem silently replaced it. Use `is None`.
+
+### Addition 2: a "dry run" feature (what scaling looks like)
+
+**The conventional way:** thread a flag through the I/O code.
+
+```python
+def sync(source, dest, dry_run=False):
+    ...
+    if not dry_run:
+        shutil.copyfile(src, dst)
+    else:
+        print("would copy", src, dst)
+    # repeated for every move/delete branch
+```
+
+**Where it breaks:** every I/O call site gets an `if`, and each new action type (say "archive instead of delete") needs the same treatment in three places. Forgetting one branch means a "dry run" that deletes files.
+
+**The better way:** the core already returns the plan. A dry run is `print(list(determine_actions(...)))` and executing nothing.
+
+**Why it's right:** features that depend on *what would happen* are free once "what would happen" is data.
+**What it costs:** nothing extra here, but the discipline of keeping decisions out of the I/O code has to hold as the project grows.
+
 ## 🛬 1,000 ft: what to notice
 - The first version tests with `tempfile`, which is slow and awkward.
 - The refactor produces a pure function of inputs → list of actions (`move`, `copy`, `delete`).
@@ -54,10 +109,40 @@ flowchart LR
 > A standalone mini-project, separate from `allocation/`. It's the book's directory-sync example: make the destination folder match the source folder. All code below was run and passes (5 tests).
 
 ```bash
-mkdir sync-exercise && cd sync-exercise
-python3 -m venv .venv && source .venv/bin/activate && pip install pytest
+uv init --bare sync-exercise --python 3.12 && cd sync-exercise   # a plain project, not an installable package
+uv add --dev uv run pytest ruff
 mkdir -p sync tests && touch sync/__init__.py
-printf '[pytest]\npythonpath = .\ntestpaths = tests\n' > pytest.ini
+```
+
+`--bare` writes only a `pyproject.toml`. Add the tool settings so pytest can import `sync` from the project root and ruff matches the main project:
+
+**📄 `pyproject.toml`**
+
+```
+[project]
+name = "sync-exercise"
+version = "0.1.0"
+description = "Functional core / imperative shell exercise"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = [".", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ```
 
 ### The rules (what "sync" means)
@@ -266,7 +351,7 @@ def test_sync_with_real_files(tmp_path):
 ```
 
 ```bash
-pytest -q
+uv run pytest -q
 # .....                                      [100%]
 # 5 passed
 ```

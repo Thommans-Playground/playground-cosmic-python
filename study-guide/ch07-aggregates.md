@@ -45,6 +45,43 @@ sequenceDiagram
     Note over T2: retry or reject, so no overselling
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: two customers, one last sofa
+
+**The conventional way:** read the stock, check it, allocate, commit, with no concurrency story.
+
+```python
+batches = uow.batches.list()           # request A and request B both read "10 available"
+batchref = model.allocate(line, batches)
+uow.commit()                           # both succeed
+```
+
+**Where it breaks**
+- 🧪 I interleaved two sessions the way two simultaneous requests would: both saw `available: 10`, each allocated 10, each committed. Result: **20 units allocated against 10 in stock, and the batch reports `available_quantity == -10`**. The customer-visible symptom is an oversold sofa.
+- It passes every sequential test you will ever write. It only fails under real concurrency, which makes it a production-only bug.
+
+**The better way** (Steps 2, 6, 7): make "all batches of one SKU" an aggregate (`Product`), bump `version_number` on every allocation, and run Postgres at `REPEATABLE READ`. 📖 Two transactions that both try to update the same product row conflict, and the loser fails with a serialization error instead of committing a stale decision. (*I could not run the Postgres test; the guide's Step 7 gives you the Docker commands.*)
+
+**Why it's right:** the invariant ("never allocate more than the SKU has") is protected by the database for you at one well-defined row, not by hoping requests don't overlap.
+**What it costs:** the loser must be retried or told to try again, so you now need that handling. And every allocation *writes* the product row, so one very hot SKU becomes a contention point.
+
+### Addition 2: who may touch a batch
+
+**The conventional way:** a repository per table (`BatchRepository`, `OrderLineRepository`), and any code may load a batch and call `batch.allocate(line)`.
+
+**Where it breaks**
+- The rules live in `Product.allocate` (preference order, the version bump). Code that loads a `Batch` directly skips all of it: it allocates to the wrong batch and silently disables the concurrency guard.
+- Transactions touch arbitrary sets of rows, so lock behaviour is unpredictable.
+- 📖 The opposite mistake is one giant aggregate ("Order" containing products, customers, stock): every change locks the world.
+
+**The better way** (Step 4): only **aggregate roots** get repositories. To change a batch you load its `Product` and ask *it*. Keep aggregates small, and refer to other aggregates by id.
+
+**Why it's right:** there is exactly one door to each consistency boundary, so the rules can't be bypassed.
+**What it costs:** touching one batch loads the whole product (all its batches). If a SKU had thousands of batches you would feel it, which is why aggregate size is a design decision, not an accident.
+
 ## 🛬 1,000 ft: design decisions
 - `Product(sku, batches, version_number)`; repo API becomes `get(sku)`.
 - Service `allocate` now: `product = uow.products.get(sku=line.sku)`; if `None` → `InvalidSku`.
@@ -55,7 +92,7 @@ sequenceDiagram
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch06 project. This is the biggest refactor of Part 1: `allocate` moves from a free function into a new `Product` class, the repository returns products instead of batches, and a version number guards against concurrent updates. 32 tests pass; the one Postgres-only concurrency test is **written but I could not run it** (no Postgres in my environment). It skips automatically unless you set `POSTGRES_URI`.
+> Starts from your finished ch06 project. This is the biggest refactor of Part 1: `allocate` moves from a free function into a new `Product` class, the repository returns products instead of batches, and a version number guards against concurrent updates. 35 tests pass, 1 skipped; the one Postgres-only concurrency test is **written but I could not run it** (no Postgres in my environment). It skips automatically unless you set `POSTGRES_URI`.
 
 ### The problem in one scenario
 
@@ -69,9 +106,10 @@ Two customers order the last 10 units of the same SKU at the same instant. Both 
 
 ```python
 from datetime import date, timedelta
+
 import pytest
 
-from allocation.domain.model import Product, OrderLine, Batch, OutOfStock
+from allocation.domain.model import Batch, OrderLine, OutOfStock, Product
 
 today = date.today()
 tomorrow = today + timedelta(days=1)
@@ -124,9 +162,7 @@ def test_raises_out_of_stock_exception_if_cannot_allocate():
 
 def test_increments_version_number():
     line = OrderLine("oref", "SCANDI-PEN", 10)
-    product = Product(
-        sku="SCANDI-PEN", batches=[Batch("b1", "SCANDI-PEN", 100, eta=None)]
-    )
+    product = Product(sku="SCANDI-PEN", batches=[Batch("b1", "SCANDI-PEN", 100, eta=None)])
     product.version_number = 7
     product.allocate(line)
     assert product.version_number == 8
@@ -137,7 +173,7 @@ def test_increments_version_number():
 ```python
 from datetime import date
 
-from allocation.domain.model import OrderLine, Batch
+from allocation.domain.model import Batch, OrderLine
 
 today = date.today()
 
@@ -206,7 +242,6 @@ def test_allocation_is_idempotent():
 ```python
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional, List, Set
 
 
 class OutOfStock(Exception):
@@ -221,12 +256,12 @@ class OrderLine:
 
 
 class Batch:
-    def __init__(self, ref: str, sku: str, qty: int, eta: Optional[date]):
+    def __init__(self, ref: str, sku: str, qty: int, eta: date | None):
         self.reference = ref
         self.sku = sku
         self.eta = eta
         self._purchased_quantity = qty
-        self._allocations: Set[OrderLine] = set()
+        self._allocations: set[OrderLine] = set()
 
     def __repr__(self):
         return f"<Batch {self.reference}>"
@@ -269,7 +304,7 @@ class Batch:
 class Product:
     """Aggregate root: all the batches for one SKU, changed only through here."""
 
-    def __init__(self, sku: str, batches: List[Batch], version_number: int = 0):
+    def __init__(self, sku: str, batches: list[Batch], version_number: int = 0):
         self.sku = sku
         self.batches = batches
         self.version_number = version_number
@@ -281,7 +316,7 @@ class Product:
             self.version_number += 1
             return batch.reference
         except StopIteration:
-            raise OutOfStock(f"Out of stock for sku {line.sku}")
+            raise OutOfStock(f"Out of stock for sku {line.sku}") from None
 ```
 
 ### Step 3: Update the ORM
@@ -291,8 +326,8 @@ class Product:
 **📄 `src/allocation/adapters/orm.py`**
 
 ```python
-from sqlalchemy import Table, Column, Integer, String, Date, ForeignKey
-from sqlalchemy.orm import registry, relationship
+from sqlalchemy import Column, Date, ForeignKey, Integer, String, Table, create_engine
+from sqlalchemy.orm import registry, relationship, sessionmaker
 
 from allocation.domain import model
 
@@ -350,6 +385,14 @@ def start_mappers():
     mapper_registry.map_imperatively(
         model.Product, products, properties={"batches": relationship(batches_mapper)}
     )
+
+
+def make_session_factory(uri: str) -> sessionmaker:
+    """Engine + tables + session factory. Postgres needs REPEATABLE READ (see ch07)."""
+    kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
+    engine = create_engine(uri, **kwargs)
+    metadata.create_all(engine)
+    return sessionmaker(bind=engine)
 ```
 
 ### Step 4: The repository now deals in products
@@ -411,9 +454,7 @@ def test_repository_can_save_a_product(session):
 
 
 def test_repository_can_retrieve_a_product_with_its_batches_and_allocations(session):
-    session.execute(
-        text('INSERT INTO products (sku, version_number) VALUES ("GENERIC-SOFA", 3)')
-    )
+    session.execute(text('INSERT INTO products (sku, version_number) VALUES ("GENERIC-SOFA", 3)'))
     session.execute(
         text(
             "INSERT INTO batches (reference, sku, _purchased_quantity, eta)"
@@ -421,9 +462,7 @@ def test_repository_can_retrieve_a_product_with_its_batches_and_allocations(sess
         )
     )
     session.execute(
-        text(
-            'INSERT INTO order_lines (orderid, sku, qty) VALUES ("order1", "GENERIC-SOFA", 12)'
-        )
+        text('INSERT INTO order_lines (orderid, sku, qty) VALUES ("order1", "GENERIC-SOFA", 12)')
     )
     session.execute(text("INSERT INTO allocations (orderline_id, batch_id) VALUES (1, 1)"))
 
@@ -459,8 +498,8 @@ session.execute(text('INSERT INTO products (sku, version_number) VALUES ("sku1",
 
 ```python
 from __future__ import annotations
+
 from datetime import date
-from typing import Optional
 
 from allocation.domain import model
 from allocation.service_layer import unit_of_work
@@ -474,7 +513,7 @@ def add_batch(
     ref: str,
     sku: str,
     qty: int,
-    eta: Optional[date],
+    eta: date | None,
     uow: unit_of_work.AbstractUnitOfWork,
 ):
     with uow:
@@ -486,9 +525,7 @@ def add_batch(
         uow.commit()
 
 
-def allocate(
-    orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork
-) -> str:
+def allocate(orderid: str, sku: str, qty: int, uow: unit_of_work.AbstractUnitOfWork) -> str:
     line = model.OrderLine(orderid, sku, qty)
     with uow:
         product = uow.products.get(sku=line.sku)
@@ -583,19 +620,30 @@ def test_prefers_warehouse_batches_to_shipments():
     assert batchref == "in-stock-batch"
 ```
 
-### Step 6: Fix the engine for Postgres, then run the suite
+### Step 6: One helper that builds the engine, then run the suite
 
-In `flask_app.py`'s default branch, create the engine with `isolation_level="REPEATABLE READ"` when running against Postgres (SQLite rejects that value, hence the `if`):
+Postgres needs `REPEATABLE READ`, but SQLite rejects that value, hence the `if`. Since more than one entrypoint will soon need an engine (ch11 adds a second), put those lines in one function in `orm.py` and call it from the app instead of repeating them:
 
 ```python
-uri = config.get_db_uri()
-kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
-engine = create_engine(uri, **kwargs)
+# orm.py (add `create_engine` and `sessionmaker` to the imports)
+def make_session_factory(uri: str) -> sessionmaker:
+    """Engine + tables + session factory. Postgres needs REPEATABLE READ (see ch07)."""
+    kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
+    engine = create_engine(uri, **kwargs)
+    metadata.create_all(engine)
+    return sessionmaker(bind=engine)
+```
+
+```python
+# in fastapi_app.create_app, replacing the inline engine code:
+if session_factory is None:
+    orm.start_mappers()
+    session_factory = orm.make_session_factory(config.get_settings().db_uri)
 ```
 
 ```bash
-pytest -q
-# 32 passed, 1 skipped
+uv run pytest -q
+# 35 passed, 1 skipped
 ```
 
 ### Step 7: The concurrency test (needs Postgres)
@@ -607,9 +655,9 @@ Start a Postgres, add the fixture below to `tests/conftest.py`, and add the test
 ```bash
 docker run -d --name pg -e POSTGRES_USER=allocation -e POSTGRES_PASSWORD=abc123 \
   -e POSTGRES_DB=allocation -p 5432:5432 postgres:16
-pip install psycopg2-binary
-POSTGRES_URI=postgresql://allocation:abc123@localhost:5432/allocation pytest -q
-# 33 passed
+uv add --dev "psycopg[binary]"
+POSTGRES_URI=postgresql+psycopg://allocation:abc123@localhost:5432/allocation uv run pytest -q
+# 36 passed
 ```
 
 **📄 `tests/conftest.py`**
@@ -619,7 +667,7 @@ import os
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, clear_mappers
+from sqlalchemy.orm import clear_mappers, sessionmaker
 
 from allocation.adapters.orm import metadata, start_mappers
 
@@ -628,13 +676,16 @@ from allocation.adapters.orm import metadata, start_mappers
 def in_memory_db():
     engine = create_engine("sqlite:///:memory:")
     metadata.create_all(engine)
-    return engine
+    yield engine
+    engine.dispose()
 
 
 @pytest.fixture
 def session(in_memory_db):
     start_mappers()
-    yield sessionmaker(bind=in_memory_db)()
+    session = sessionmaker(bind=in_memory_db)()
+    yield session
+    session.close()
     clear_mappers()
 
 
@@ -644,7 +695,17 @@ def session_factory(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/test.db")
     metadata.create_all(engine)
     start_mappers()
-    yield sessionmaker(bind=engine)
+    factory = sessionmaker(bind=engine)
+    opened = []
+
+    def tracked():
+        session = factory()
+        opened.append(session)
+        return session
+
+    yield tracked
+    for session in opened:  # close everything the test (or the app under test) opened
+        session.close()
     clear_mappers()
     engine.dispose()
 
@@ -652,7 +713,7 @@ def session_factory(tmp_path):
 @pytest.fixture
 def postgres_session_factory():
     """Only used by the concurrency test, which needs a real Postgres.
-    Run with:  POSTGRES_URI=postgresql://allocation:abc123@localhost:5432/allocation pytest
+    Run with:  POSTGRES_URI=postgresql+psycopg://allocation:abc123@localhost:5432/allocation pytest
     """
     uri = os.environ.get("POSTGRES_URI")
     if not uri:
@@ -672,6 +733,7 @@ def postgres_session_factory():
 import threading
 import time
 import traceback
+
 import pytest
 from sqlalchemy import text
 
@@ -742,10 +804,9 @@ def test_rolls_back_on_error(session_factory):
         pass
 
     uow = unit_of_work.SqlAlchemyUnitOfWork(session_factory)
-    with pytest.raises(MyException):
-        with uow:
-            insert_batch(uow.session, "batch1", "LARGE-FORK", 100, None)
-            raise MyException()
+    with pytest.raises(MyException), uow:
+        insert_batch(uow.session, "batch1", "LARGE-FORK", 100, None)
+        raise MyException()
 
     new_session = session_factory()
     rows = list(new_session.execute(text('SELECT * FROM "batches"')))
@@ -760,7 +821,7 @@ def try_to_allocate(session_factory, orderid, sku, exceptions):
             product.allocate(line)
             time.sleep(0.2)  # hold the transaction open so the two overlap
             uow.commit()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(traceback.format_exc())
         exceptions.append(e)
 

@@ -1,7 +1,7 @@
 # Chapter 9: Going to Town on the Message Bus
 
 ## ✈️ 30,000 ft
-Make the message bus the **main entrypoint** of the whole application. The service layer disappears into handlers: every use case is "an event arrives → a handler runs". Flask just builds a message and hands it to the bus.
+Make the message bus the **main entrypoint** of the whole application. The service layer disappears into handlers: every use case is "an event arrives → a handler runs". FastAPI just builds a message and hands it to the bus.
 
 ## 🛫 10,000 ft
 - Services become **handlers**; each takes `(event, uow)`.
@@ -15,7 +15,7 @@ Make the message bus the **main entrypoint** of the whole application. The servi
 
 ```mermaid
 flowchart TB
-    Flask[Flask] -->|build event| Bus
+    FastAPI[FastAPI] -->|build event| Bus
     CLI[CLI / Redis later] -->|build event| Bus
     subgraph Bus["MessageBus.handle"]
         Q[queue] --> Pop{pop message}
@@ -40,21 +40,81 @@ sequenceDiagram
     end
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: "a batch shrank, so move the bumped orders elsewhere"
+
+**The conventional way:** do the reallocation inline, inside the same handler and transaction.
+
+```python
+def change_batch_quantity(ref, qty, uow):
+    with uow:
+        product = uow.products.get_by_batchref(ref)
+        batch = product.get_batch(ref)
+        batch._purchased_quantity = qty
+        while batch.available_quantity < 0:
+            line = batch.deallocate_one()
+            product.allocate(line)          # re-allocate right here
+        uow.commit()
+```
+
+**Where it breaks**
+- One transaction now carries two different stories: "the shipment lost units" (a fact that must stand) and "find homes for the bumped orders" (best effort). If any reallocation fails, the whole thing rolls back, **including the quantity change**, and the system believes the damaged shipment is intact.
+- The long loop holds the product's row for as long as it runs.
+- The allocation logic is duplicated or tangled into a handler that is about something else.
+
+**The better way** (Steps 2, 5): `Product.change_batch_quantity` only deallocates and emits an event/request per freed line; the **bus** handles each as its own message and its own transaction.
+
+**Why it's right:** the fact is committed first and stays committed; each reallocation succeeds or fails on its own.
+**What it costs:** **eventual consistency**: for a moment the batch is shrunk and the bumped lines are unallocated, and a reader looking right then sees that intermediate state. You have to be comfortable with that, and with failures that leave some lines unreallocated (which ch10 makes visible rather than silent).
+
+### Addition 2: handling the follow-up messages
+
+**The conventional way:** the bus calls itself recursively.
+
+```python
+def handle(event):
+    for handler in HANDLERS[type(event)]:
+        handler(event)        # a handler may call handle(new_event) from inside
+```
+
+**Where it breaks** 📖
+- The follow-up runs *inside* the first handler, before that handler has finished, so you can observe half-finished work. Execution order depends on call nesting, which is hard to predict.
+- Long chains nest deeply, and every handler has to know it is responsible for calling `handle`.
+
+**The better way** (Step 5): a **queue** in the bus: run a handler, collect the new events from the UoW, append them, and take the next message.
+
+**Why it's right:** each message is processed to completion, in a predictable first-in-first-out order, and handlers don't need to know about the bus.
+**What it costs:** a loop is easy to write infinitely (an event that always produces another), and stepping through a chain in a debugger takes more thought than reading a call stack.
+
+### Addition 3: two ways into the system
+
+**The conventional way:** requests use service functions, events use a bus. Two dispatch paths.
+
+**Where it breaks:** logging, error handling and transaction rules need implementing twice, and sooner or later they differ.
+
+**The better way:** one entrypoint, the bus, for everything; services become handlers.
+
+**Why it's right:** one place for cross-cutting behaviour (ch10 adds error policy there).
+**What it costs:** the bus becomes the hub of the system, and "everything is a message" blurs requests with facts until ch10 separates them.
+
 ## 🛬 1,000 ft: design decisions
 - `handle(event, uow)` returns after draining `queue`. Handlers are registered in dict `{EventType: [handlers]}`.
 - `Product.change_batch_quantity(ref, qty)` deallocates lines until the batch is no longer over-allocated and emits `AllocationRequired` events for each freed line.
 - The test style: **service-style tests become tests that send events through the bus** and inspect the fake UoW.
-- Flask shrinks to: parse JSON → `messagebus.handle(event, uow)`.
+- FastAPI shrinks to: parse JSON → `messagebus.handle(event, uow)`.
 
 ## 🛞 Touchdown: code along
 
-> Starts from your finished ch08 project. New requirement: **when a shipment is damaged, a batch's quantity drops; if it's now over-allocated, deallocate enough lines and re-allocate them elsewhere.** To do it cleanly, the message bus becomes the *only* entrypoint and `services.py` turns into `handlers.py`. 35 tests pass, 1 skipped (Postgres).
+> Starts from your finished ch08 project. New requirement: **when a shipment is damaged, a batch's quantity drops; if it's now over-allocated, deallocate enough lines and re-allocate them elsewhere.** To do it cleanly, the message bus becomes the *only* entrypoint and `services.py` turns into `handlers.py`. 38 tests pass, 1 skipped (Postgres).
 
 ### The shape of the change
 
 ```
-Before:  Flask → services.allocate(...)            (and services publish events)
-After:   Flask → messagebus.handle(AllocationRequired(...), uow)
+Before:  FastAPI → services.allocate(...)            (and services publish events)
+After:   FastAPI → messagebus.handle(AllocationRequired(...), uow)
                     └─ handler runs → new events go back onto the bus's queue
 ```
 
@@ -65,9 +125,8 @@ After:   Flask → messagebus.handle(AllocationRequired(...), uow)
 **📄 `src/allocation/domain/events.py`**
 
 ```python
-from datetime import date
 from dataclasses import dataclass
-from typing import Optional
+from datetime import date
 
 
 class Event:
@@ -79,7 +138,7 @@ class BatchCreated(Event):
     ref: str
     sku: str
     qty: int
-    eta: Optional[date] = None
+    eta: date | None = None
 
 
 @dataclass
@@ -149,6 +208,7 @@ def _get_by_batchref(self, batchref):
 
 ```python
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 from allocation.adapters import email
@@ -184,18 +244,14 @@ def allocate(event: events.AllocationRequired, uow: unit_of_work.AbstractUnitOfW
         return batchref
 
 
-def change_batch_quantity(
-    event: events.BatchQuantityChanged, uow: unit_of_work.AbstractUnitOfWork
-):
+def change_batch_quantity(event: events.BatchQuantityChanged, uow: unit_of_work.AbstractUnitOfWork):
     with uow:
         product = uow.products.get_by_batchref(batchref=event.ref)
         product.change_batch_quantity(ref=event.ref, qty=event.qty)
         uow.commit()
 
 
-def send_out_of_stock_notification(
-    event: events.OutOfStock, uow: unit_of_work.AbstractUnitOfWork
-):
+def send_out_of_stock_notification(event: events.OutOfStock, uow: unit_of_work.AbstractUnitOfWork):
     email.send(
         "stock@made.com",
         f"Out of stock for {event.sku}",
@@ -206,15 +262,18 @@ def send_out_of_stock_notification(
 
 **Do:** rewrite `messagebus.handle(event, uow)`.
 
-**Why:** handling one message may create more (an out-of-stock event, a re-allocation request). A queue processes them in the order they appear, and after each handler we ask the UoW for the events it produced. We also collect the handlers' return values so the caller (Flask) can get the batch reference back.
+**Why:** handling one message may create more (an out-of-stock event, a re-allocation request). A queue processes them in the order they appear, and after each handler we ask the UoW for the events it produced. We also collect the handlers' return values so the caller (FastAPI) can get the batch reference back.
 
 **📄 `src/allocation/service_layer/messagebus.py`**
 
 ```python
 from __future__ import annotations
-from typing import List, Dict, Callable, Type, TYPE_CHECKING
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from allocation.domain import events
+
 from . import handlers
 
 if TYPE_CHECKING:
@@ -233,12 +292,12 @@ def handle(event: events.Event, uow: unit_of_work.AbstractUnitOfWork):
     return results
 
 
-HANDLERS = {
+HANDLERS: dict[type[events.Event], list[Callable]] = {
     events.BatchCreated: [handlers.add_batch],
     events.BatchQuantityChanged: [handlers.change_batch_quantity],
     events.AllocationRequired: [handlers.allocate],
     events.OutOfStock: [handlers.send_out_of_stock_notification],
-}  # type: Dict[Type[events.Event], List[Callable]]
+}
 ```
 
 ### Step 6: The UoW stops publishing
@@ -250,6 +309,7 @@ HANDLERS = {
 ```python
 # pylint: disable=attribute-defined-outside-init
 from __future__ import annotations
+
 import abc
 
 from allocation.adapters import repository
@@ -306,7 +366,6 @@ class SqlAlchemyUnitOfWork(AbstractUnitOfWork):
 
 ```python
 import abc
-from typing import Set
 
 from allocation.adapters import orm
 from allocation.domain import model
@@ -315,7 +374,7 @@ from allocation.domain import model
 class AbstractRepository(abc.ABC):
     def __init__(self):
         # every aggregate that passes through the repo; the UoW reads its events
-        self.seen = set()  # type: Set[model.Product]
+        self.seen: set[model.Product] = set()
 
     def add(self, product: model.Product):
         self._add(product)
@@ -366,16 +425,17 @@ class SqlAlchemyRepository(AbstractRepository):
         )
 ```
 
-### Step 7: Flask builds events and hands them to the bus
+### Step 7: The endpoints build events and hand them to the bus
 
-**📄 `src/allocation/entrypoints/flask_app.py`**
+**Do:** each endpoint builds an event and calls `messagebus.handle(event, uow)`. Note `new_uow()`: **one Unit of Work per request**. FastAPI runs these sync endpoints in a thread pool, and a UoW holds its session as state, so a UoW shared between requests would be a race.
+
+**📄 `src/allocation/entrypoints/fastapi_app.py`**
 
 ```python
-from datetime import datetime
+from datetime import date
 
-from flask import Flask, request
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from allocation import config
 from allocation.adapters import orm
@@ -383,44 +443,50 @@ from allocation.domain import events
 from allocation.service_layer import handlers, messagebus, unit_of_work
 
 
-def create_app(session_factory=None):
+class AddBatchRequest(BaseModel):
+    ref: str
+    sku: str
+    qty: int = Field(gt=0)
+    eta: date | None = None  # pydantic parses "2030-01-01" for us
+
+
+class AllocateRequest(BaseModel):
+    orderid: str
+    sku: str
+    qty: int = Field(gt=0)
+
+
+class AllocateResponse(BaseModel):
+    batchref: str
+
+
+def create_app(session_factory=None) -> FastAPI:
     if session_factory is None:
-        uri = config.get_db_uri()
-        kwargs = {"isolation_level": "REPEATABLE READ"} if uri.startswith("postgresql") else {}
-        engine = create_engine(uri, **kwargs)
-        orm.metadata.create_all(engine)
         orm.start_mappers()
-        session_factory = sessionmaker(bind=engine)
+        session_factory = orm.make_session_factory(config.get_settings().db_uri)
 
-    app = Flask(__name__)
+    app = FastAPI(title="Allocation service")
 
-    @app.route("/add_batch", methods=["POST"])
-    def add_batch():
-        eta = request.json["eta"]
-        if eta is not None:
-            eta = datetime.fromisoformat(eta).date()
-        event = events.BatchCreated(
-            request.json["ref"], request.json["sku"], request.json["qty"], eta
-        )
-        messagebus.handle(event, unit_of_work.SqlAlchemyUnitOfWork(session_factory))
-        return "OK", 201
+    def new_uow():
+        # one UoW per request: sessions are never shared between threads
+        return unit_of_work.SqlAlchemyUnitOfWork(session_factory)
 
-    @app.route("/allocate", methods=["POST"])
-    def allocate_endpoint():
+    @app.post("/add_batch", status_code=201)
+    def add_batch_endpoint(body: AddBatchRequest) -> None:
+        messagebus.handle(events.BatchCreated(body.ref, body.sku, body.qty, body.eta), new_uow())
+
+    @app.post("/allocate", status_code=201)
+    def allocate_endpoint(body: AllocateRequest) -> AllocateResponse:
         try:
-            event = events.AllocationRequired(
-                request.json["orderid"], request.json["sku"], request.json["qty"]
-            )
             results = messagebus.handle(
-                event, unit_of_work.SqlAlchemyUnitOfWork(session_factory)
+                events.AllocationRequired(body.orderid, body.sku, body.qty), new_uow()
             )
             batchref = results.pop(0)
         except handlers.InvalidSku as e:
-            return {"message": str(e)}, 400
-
+            raise HTTPException(status_code=400, detail=str(e)) from e
         if batchref is None:
-            return {"message": f"Out of stock for sku {request.json['sku']}"}, 400
-        return {"batchref": batchref}, 201
+            raise HTTPException(status_code=400, detail=f"Out of stock for sku {body.sku}")
+        return AllocateResponse(batchref=batchref)
 
     return app
 ```
@@ -489,12 +555,8 @@ class TestAddBatch:
 class TestAllocate:
     def test_allocates(self):
         uow = FakeUnitOfWork()
-        messagebus.handle(
-            events.BatchCreated("batch1", "COMPLICATED-LAMP", 100, None), uow
-        )
-        results = messagebus.handle(
-            events.AllocationRequired("o1", "COMPLICATED-LAMP", 10), uow
-        )
+        messagebus.handle(events.BatchCreated("batch1", "COMPLICATED-LAMP", 100, None), uow)
+        results = messagebus.handle(events.AllocationRequired("o1", "COMPLICATED-LAMP", 10), uow)
         assert results.pop(0) == "batch1"
         [batch] = uow.products.get("COMPLICATED-LAMP").batches
         assert batch.available_quantity == 90
@@ -528,9 +590,7 @@ class TestAllocate:
 class TestChangeBatchQuantity:
     def test_changes_available_quantity(self):
         uow = FakeUnitOfWork()
-        messagebus.handle(
-            events.BatchCreated("batch1", "ADORABLE-SETTEE", 100, None), uow
-        )
+        messagebus.handle(events.BatchCreated("batch1", "ADORABLE-SETTEE", 100, None), uow)
         [batch] = uow.products.get(sku="ADORABLE-SETTEE").batches
         assert batch.available_quantity == 100
 
@@ -561,13 +621,13 @@ class TestChangeBatchQuantity:
 ```
 
 ```bash
-pytest -q
-# 35 passed, 1 skipped
+uv run pytest -q
+# 38 passed, 1 skipped
 ```
 
 ### Stretch
 
-- Add `POST /change_batch_quantity` to the Flask app. Which files change? (Only the entrypoint; the point of the bus.)
+- Add `POST /change_batch_quantity` to the FastAPI app. Which files change? (Only the entrypoint; the point of the bus.)
 - What would happen to ordering if `change_batch_quantity` freed three lines while a fourth `AllocationRequired` is already in the queue? Write a test.
 
 ## Check yourself

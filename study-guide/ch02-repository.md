@@ -41,6 +41,75 @@ classDiagram
     class Session
 ```
 
+## 🛫 5,000 ft: the conventional way vs. the better way
+
+> Evidence tags: 🧪 I ran it · 🧮 arithmetic · 📖 documentation or reasoning (not run).
+
+### Addition 1: getting batches out of the database
+
+**The conventional way:** query the ORM wherever you need data.
+
+```python
+def allocate(orderid, sku, qty):
+    batches = session.query(Batch).filter(Batch.sku == sku).all()
+    ...
+
+def stock_report():
+    for b in session.query(Batch).order_by(Batch.reference):
+        ...
+```
+
+**Where it breaks**
+- Every function that needs batches needs a database, so every test either hits one or builds a chain of mocks (see Addition 3).
+- Storage details leak everywhere. Rename a column or split a table and you grep the whole codebase for `session.query(Batch)`.
+- There is no seam to put a different store behind (an in-memory fake for tests, CSV files in Appendix C).
+
+**The better way** (Steps 3-4): a **repository**, a collection-like interface with the smallest API the app needs (`add`, `get`, `list`).
+
+**Why it's right:** one place knows how batches are stored; everything else asks for batches the way it would ask a `set`.
+**What it costs:** one more class per aggregate, and if your app is basically forms over tables, this is ceremony with no payoff.
+
+### Addition 2: who depends on whom, model or ORM?
+
+**The conventional way:** the model *is* the ORM class.
+
+```python
+class Batch(db.Model):                      # Django / Flask-SQLAlchemy style
+    id = db.Column(db.Integer, primary_key=True)
+    reference = db.Column(db.String(255))
+    eta = db.Column(db.Date, nullable=True)
+    allocations = db.relationship("OrderLine", secondary=allocations_table)
+```
+
+**Where it breaks**
+- The domain class is shaped by the table: every column, nullable flag and relationship option is part of your business object, so changing the schema means changing the domain.
+- You can't import the business rules without importing the database toolkit and its configuration.
+- 📖 The business objects' own design (value objects, sets, the `__eq__` rules from ch01) now has to coexist with the ORM's instrumentation, and you find out the clashes one at a time. (We hit one even with the inverted design: SQLAlchemy 2.x can't map a `frozen=True` dataclass; see ch01's version note.)
+
+**The better way** (Step 1): invert it. `orm.py` imports `model.py` and maps the plain classes onto tables. `model.py` imports nothing from SQLAlchemy.
+
+**Why it's right:** the dependency arrow points at the domain, so storage can change without the rules noticing.
+**What it costs:** you write the mapping by hand and keep two descriptions (class and table) in sync; some ORM conveniences are gone.
+
+### Addition 3: testing code that uses storage
+
+**The conventional way:** mock the session.
+
+```python
+def test_gets_batch():
+    session = MagicMock()
+    session.query.return_value.filter_by.return_value.one.return_value = batch
+    assert get_batch(session, "b1") is batch
+```
+
+**Where it breaks**
+- 🧪 Change the implementation from `.one()` to `.first()`, same behaviour, and the same mock now hands back a `MagicMock` instead of `batch`. The test fails (or worse, passes on garbage) though nothing observable changed. The test is a line-by-line transcript of the implementation.
+
+**The better way** (Step 4): a **fake** repository (just a `set`) for fast tests, plus a handful of integration tests against a real session that prove the real repository behaves like the fake.
+
+**Why it's right:** tests assert on behaviour ("after `add`, `get` finds it"), so they survive refactoring.
+**What it costs:** you maintain the fake, and it must stay honest. The integration tests exist precisely to catch a fake that has drifted from reality.
+
 ## 🛬 1,000 ft: design decisions
 - `AbstractRepository(abc.ABC)` with `@abc.abstractmethod`. The book says the ABC is optional documentation; duck typing works too.
 - Classical/imperative mapping in `orm.py`: `Table` definitions, then map the existing classes. SQLAlchemy 2.x: `registry.map_imperatively(model.OrderLine, order_lines)`; the book's `mapper(...)` is the 1.x spelling.
@@ -54,7 +123,7 @@ classDiagram
 ### Step 0: Dependencies and folders
 
 ```bash
-pip install sqlalchemy
+uv add sqlalchemy
 mkdir -p src/allocation/adapters tests/integration
 touch src/allocation/adapters/__init__.py
 ```
@@ -73,7 +142,7 @@ Key points to understand in the code:
 **📄 `src/allocation/adapters/orm.py`**
 
 ```python
-from sqlalchemy import Table, Column, Integer, String, Date, ForeignKey
+from sqlalchemy import Column, Date, ForeignKey, Integer, String, Table
 from sqlalchemy.orm import registry, relationship
 
 from allocation.domain import model
@@ -136,7 +205,7 @@ def start_mappers():
 ```python
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, clear_mappers
+from sqlalchemy.orm import clear_mappers, sessionmaker
 
 from allocation.adapters.orm import metadata, start_mappers
 
@@ -159,6 +228,7 @@ def session(in_memory_db):
 
 ```python
 from datetime import date
+
 from sqlalchemy import text
 
 from allocation.domain import model
@@ -215,9 +285,7 @@ def test_saving_batches(session):
     batch = model.Batch("batch1", "sku1", 100, eta=None)
     session.add(batch)
     session.commit()
-    rows = session.execute(
-        text('SELECT reference, sku, _purchased_quantity, eta FROM "batches"')
-    )
+    rows = session.execute(text('SELECT reference, sku, _purchased_quantity, eta FROM "batches"'))
     assert list(rows) == [("batch1", "sku1", 100, None)]
 
 
@@ -323,18 +391,13 @@ def test_repository_can_save_a_batch(session):
     repo.add(batch)
     session.commit()
 
-    rows = session.execute(
-        text('SELECT reference, sku, _purchased_quantity, eta FROM "batches"')
-    )
+    rows = session.execute(text('SELECT reference, sku, _purchased_quantity, eta FROM "batches"'))
     assert list(rows) == [("batch1", "RUSTY-SOAPDISH", 100, None)]
 
 
 def insert_order_line(session):
     session.execute(
-        text(
-            "INSERT INTO order_lines (orderid, sku, qty)"
-            ' VALUES ("order1", "GENERIC-SOFA", 12)'
-        )
+        text('INSERT INTO order_lines (orderid, sku, qty) VALUES ("order1", "GENERIC-SOFA", 12)')
     )
     [[orderline_id]] = session.execute(
         text("SELECT id FROM order_lines WHERE orderid=:orderid AND sku=:sku"),
@@ -360,10 +423,7 @@ def insert_batch(session, batch_id):
 
 def insert_allocation(session, orderline_id, batch_id):
     session.execute(
-        text(
-            "INSERT INTO allocations (orderline_id, batch_id)"
-            " VALUES (:orderline_id, :batch_id)"
-        ),
+        text("INSERT INTO allocations (orderline_id, batch_id) VALUES (:orderline_id, :batch_id)"),
         dict(orderline_id=orderline_id, batch_id=batch_id),
     )
 
@@ -387,7 +447,7 @@ def test_repository_can_retrieve_a_batch_with_allocations(session):
 ### Step 5: Run everything
 
 ```bash
-pytest -q
+uv run pytest -q
 # 19 passed
 ```
 
