@@ -207,6 +207,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 *Why `src/` layout?* The code in `src/allocation` is the thing you ship. Tests live beside it, not inside it, and import it like any other user would. `uv sync` rebuilds the same environment from `uv.lock` on any machine.
 
+*Why a package called `allocation`?* The name is just the book's domain (allocating orders to stock); call yours anything, but every import in the guide says `allocation`, so keep it while you follow along. The point of `--package` is that your code becomes an **importable package**, installed in editable mode: any file, test or entrypoint can write `from allocation.domain import model` and it resolves the same way everywhere, with no `PYTHONPATH` tricks. It also makes the layers visible in the import lines (`allocation.domain`, `allocation.adapters`, `allocation.service_layer`, `allocation.entrypoints`), which is how you'll spot a dependency pointing the wrong way. A plain `uv init` makes a script-style project (a `main.py`, nothing importable); ch03's exercise deliberately uses one so you can compare. For a tiny script a package is overkill; with a dozen modules importing each other across layers it isn't.
+
 The four commands you'll use all the time:
 
 ```bash

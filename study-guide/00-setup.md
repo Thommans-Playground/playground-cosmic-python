@@ -49,6 +49,10 @@ allocation/
 
 (Ch03 is a small standalone exercise in its own folder, `sync-exercise/`.)
 
+### Why a package called `allocation`?
+
+The name comes from the book's domain (allocating orders to stock) and every import in the guide uses it, so keep it while you follow along. `uv init --package` makes your code an **importable, editable-installed package** under `src/allocation/`, so tests, the API, the Redis consumer and the bootstrap all write `from allocation.domain import model` and it resolves identically, with no `PYTHONPATH` tricks. The folders then show the architecture in the import lines (`allocation.domain`, `.adapters`, `.service_layer`, `.entrypoints`), which is how you notice a dependency pointing the wrong way. The `src/` layout also means tests import the *installed* package rather than whatever is in the current directory. A plain `uv init` would give a script-style project with a `main.py` and nothing importable; ch03's exercise uses one on purpose for contrast.
+
 ## Dependencies, added as you need them
 
 | From chapter | Command | Why |
